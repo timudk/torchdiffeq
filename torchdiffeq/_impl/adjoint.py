@@ -8,6 +8,8 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, *args):
+        print('Odeint forward pass.')
+
         assert len(args) >= 8, 'Internal error: all arguments required.'
         y0, func, t, flat_params, rtol, atol, method, options = \
             args[:-7], args[-7], args[-6], args[-5], args[-4], args[-3], args[-2], args[-1]
@@ -21,6 +23,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *grad_output):
+        print('Odeint backward pass.')
 
         t, flat_params, *ans = ctx.saved_tensors
         ans = tuple(ans)
@@ -30,6 +33,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
         # TODO: use a nn.Module and call odeint_adjoint to implement higher order derivatives.
         def augmented_dynamics(t, y_aug):
+            print('Augmented dynamics call.')
             # Dynamics of the original system augmented with
             # the adjoint wrt y, and an integrator wrt t and args.
             y, adj_y = y_aug[:n_tensors], y_aug[n_tensors:2 * n_tensors]  # Ignore adj_time and adj_params.
@@ -103,7 +107,7 @@ class OdeintAdjointMethod(torch.autograd.Function):
 
 
 def odeint_adjoint(func, y0, t, rtol=1e-6, atol=1e-12, method=None, options=None):
-
+    print('odeint_adjoint pass.')
     # We need this in order to access the variables inside this module,
     # since we have no other way of getting variables along the execution path.
     if not isinstance(func, nn.Module):

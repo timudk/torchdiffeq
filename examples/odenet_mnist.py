@@ -9,6 +9,8 @@ from torch.utils.data import DataLoader
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
+import pdb
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
 parser.add_argument('--tol', type=float, default=1e-3)
@@ -121,6 +123,8 @@ class ODEBlock(nn.Module):
         self.integration_time = torch.tensor([0, 1]).float()
 
     def forward(self, x):
+        print('ODEBlock forward pass.')
+
         self.integration_time = self.integration_time.type_as(x)
         out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
         return out[1]
@@ -286,13 +290,20 @@ if __name__ == '__main__':
 
     if args.downsampling_method == 'conv':
         downsampling_layers = [
-            nn.Conv2d(1, 64, 3, 1),
-            norm(64),
+            # nn.Conv2d(1, 64, 3, 1),
+            # norm(64),
+            # nn.ReLU(inplace=True),
+            # nn.Conv2d(64, 64, 4, 2, 1),
+            # norm(64),
+            # nn.ReLU(inplace=True),
+            # nn.Conv2d(64, 64, 4, 2, 1),
+            nn.Conv2d(1, 32, 3, 1),
+            norm(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 4, 2, 1),
-            norm(64),
+            nn.Conv2d(32, 32, 4, 2, 1),
+            norm(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 4, 2, 1),
+            nn.Conv2d(32, 32, 4, 2, 1),
         ]
     elif args.downsampling_method == 'res':
         downsampling_layers = [
@@ -301,8 +312,10 @@ if __name__ == '__main__':
             ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
         ]
 
-    feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
-    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+    # feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+    # fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+    feature_layers = [ODEBlock(ODEfunc(32))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+    fc_layers = [norm(32), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(32, 10)]
 
     model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
 
@@ -340,6 +353,7 @@ if __name__ == '__main__':
         x, y = data_gen.__next__()
         x = x.to(device)
         y = y.to(device)
+
         logits = model(x)
         loss = criterion(logits, y)
 
@@ -347,7 +361,10 @@ if __name__ == '__main__':
             nfe_forward = feature_layers[0].nfe
             feature_layers[0].nfe = 0
 
+        # pdb.set_trace()
+        print('Loss.')
         loss.backward()
+        print('Optimizer step.')
         optimizer.step()
 
         if is_odenet:
@@ -360,17 +377,17 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % batches_per_epoch == 0:
-            with torch.no_grad():
-                train_acc = accuracy(model, train_eval_loader)
-                val_acc = accuracy(model, test_loader)
-                if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
-                    best_acc = val_acc
-                logger.info(
-                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
-                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                        b_nfe_meter.avg, train_acc, val_acc
-                    )
-                )
+        # if itr % batches_per_epoch == 0:
+        #     with torch.no_grad():
+        #         train_acc = accuracy(model, train_eval_loader)
+        #         val_acc = accuracy(model, test_loader)
+        #         if val_acc > best_acc:
+        #             torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+        #             best_acc = val_acc
+        #         logger.info(
+        #             "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+        #             "Train Acc {:.4f} | Test Acc {:.4f}".format(
+        #                 itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+        #                 b_nfe_meter.avg, train_acc, val_acc
+        #             )
+        #         )
