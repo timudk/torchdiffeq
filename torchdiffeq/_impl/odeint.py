@@ -18,7 +18,7 @@ SOLVERS = {
 
 
 def odeint(func, y0, t, rtol=1e-7, atol=1e-9, method=None, options=None):
-    print('Calling odeint.')
+    # print('Calling odeint.')
 
     """Integrate a system of ordinary differential equations.
 
