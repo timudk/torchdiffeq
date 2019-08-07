@@ -51,6 +51,8 @@ class PeaksTrainingSet(Dataset):
             self.x[i, 1] = self.data[0][i][1]
             self.y[i] = self.data[0][i][2]
 
+        print('Number of training points:', self.__len__())
+
     def __len__(self):
         return len(self.data[0])
 
@@ -87,12 +89,14 @@ class ODEfunc(nn.Module):
     def __init__(self, size):
         super(ODEfunc, self).__init__()
         self.input = nn.Linear(3 + N_LIFTING, size)
-        # self.norm1 = nn.GroupNorm(size)
-        self.relu = nn.ReLU(inplace=True)
+        # self.norm1 = nn.BatchNorm1d(size)
         self.linear1 = nn.Linear(size + 1, size)
-        # self.norm2 = nn.GroupNorm(size)
-        self.linear2 = nn.Linear(size + 1, 2 + N_LIFTING)
-        # self.norm3 = nn.GroupNorm(size)
+        self.linear2 = nn.Linear(size + 1, size)
+        self.linear3 = nn.Linear(size + 1, size)
+        # self.norm2 = nn.BatchNorm1d(size)
+        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
+        self.relu = nn.ReLU(inplace=True)
+        # self.norm3 = nn.BatchNorm1d(2 + N_LIFTING)
         self.nfe = 0
 
     def forward(self, t, x):
@@ -107,6 +111,10 @@ class ODEfunc(nn.Module):
         # out = self.norm2(out)
         out = self.relu(out)
         out = self.linear2(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear3(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.output(torch.cat([tt, out], 1))
         # out = self.norm3(out)
         return out
 
@@ -169,14 +177,14 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
     ])
 
     train_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
-        shuffle=True, num_workers=2, drop_last=True
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=batch_size,
+        shuffle=True, num_workers=1, drop_last=True
     )
 
 
     test_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
-        shuffle=False, num_workers=2, drop_last=True
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=test_batch_size, 
+        shuffle=False, num_workers=1, drop_last=True
     )
 
     return train_loader, test_loader
@@ -289,11 +297,12 @@ if __name__ == '__main__':
     batches_per_epoch = len(train_loader)
 
     lr_fn = learning_rate_with_decay(
-        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
         decay_rates=[1, 0.1, 0.01, 0.001]
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -303,8 +312,8 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_fn(itr)
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
@@ -339,8 +348,9 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % batches_per_epoch == 0:
+        if itr % (10*batches_per_epoch) == 0:
             with torch.no_grad():
+                # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
                     torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
