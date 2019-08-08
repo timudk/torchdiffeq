@@ -35,7 +35,7 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 5
-N_LIFTING = 5
+N_LIFTING = 1
 LAYER_WIDTH = 16
 
 class PeaksTrainingSet(Dataset):
@@ -43,7 +43,7 @@ class PeaksTrainingSet(Dataset):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
 
-        self.x = np.zeros((len(self.data[0]), 2 + N_LIFTING))
+        self.x = np.zeros((len(self.data[0]), 2*(2 + N_LIFTING)))
         self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
 
         for i in range(len(self.data[0])):
@@ -67,7 +67,7 @@ class PeaksTestSet(Dataset):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
 
-        self.x = np.zeros((len(self.data[1]), 2 + N_LIFTING))
+        self.x = np.zeros((len(self.data[1]), 2*(2 + N_LIFTING)))
         self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
 
         for i in range(len(self.data[1])):
@@ -89,35 +89,39 @@ class ODEfunc(nn.Module):
     def __init__(self, size):
         super(ODEfunc, self).__init__()
         self.input = nn.Linear(3 + N_LIFTING, size)
-        # self.norm1 = nn.BatchNorm1d(size)
         self.linear1 = nn.Linear(size + 1, size)
         self.linear2 = nn.Linear(size + 1, size)
         self.linear3 = nn.Linear(size + 1, size)
-        # self.norm2 = nn.BatchNorm1d(size)
         self.output = nn.Linear(size + 1, 2 + N_LIFTING)
         self.relu = nn.ReLU(inplace=True)
-        # self.norm3 = nn.BatchNorm1d(2 + N_LIFTING)
         self.nfe = 0
 
     def forward(self, t, x):
-        tt = torch.ones_like(x[:, 0]) * t
+        x_used = x[:, :(2 + N_LIFTING)]
+        # print(x.shape)
+        # print(x_used.shape)
+
+        tt = torch.ones_like(x_used[:, 0]) * t
         tt = tt[:, None]
  
         self.nfe += 1
-        out = self.input(torch.cat([tt, x], 1))
-        # out = self.norm1(out)
+        out = self.input(torch.cat([tt, x_used], 1))
         out = self.relu(out)
         out = self.linear1(torch.cat([tt, out], 1))
-        # out = self.norm2(out)
         out = self.relu(out)
         out = self.linear2(torch.cat([tt, out], 1))
         out = self.relu(out)
         out = self.linear3(torch.cat([tt, out], 1))
         out = self.relu(out)
         out = self.output(torch.cat([tt, out], 1))
-        # out = self.norm3(out)
-        return out
 
+
+        y_dot = x[:, (2 + N_LIFTING):]
+        # print(y_dot.shape)
+        y_dot_dot = -x[:, (2 + N_LIFTING):] + out
+        # print(y_dot_dot.shape)
+
+        return torch.cat([y_dot, y_dot_dot], 1) 
 
 class ODEBlock(nn.Module):
 
@@ -177,13 +181,13 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
     ])
 
     train_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=batch_size,
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
         shuffle=True, num_workers=1, drop_last=True
     )
 
 
     test_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=test_batch_size, 
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
         shuffle=False, num_workers=1, drop_last=True
     )
 
@@ -280,7 +284,7 @@ if __name__ == '__main__':
     is_odenet = args.network == 'odenet'
 
     feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
-    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2 + N_LIFTING, N_CLASSES)]
+    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2*(2 + N_LIFTING), N_CLASSES)]
 
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
 
@@ -348,7 +352,7 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % (10*batches_per_epoch) == 0:
+        if itr % (5*batches_per_epoch) == 0:
             with torch.no_grad():
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
@@ -361,4 +365,8 @@ if __name__ == '__main__':
                         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
                         b_nfe_meter.avg, val_acc
                     )
+                )
+        elif itr % (batches_per_epoch) == 0 and itr % (5*batches_per_epoch) != 0:
+            logger.info(
+                    "Epoch {:04d}".format(itr // batches_per_epoch)
                 )
