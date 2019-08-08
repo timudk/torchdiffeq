@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data import Dataset
 import torchvision.datasets as datasets
@@ -23,7 +24,6 @@ parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False]
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-
 parser.add_argument('--save', type=str, default='./experiment1')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
@@ -35,8 +35,16 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 5
-N_LIFTING = 5
-LAYER_WIDTH = 16
+N_LIFTING = 2
+HYPERNET_DIM = 8
+HYPERNET_HIDDEN_LAYERS = 8
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1 or classname.find('Conv') != -1:
+        nn.init.constant_(m.weight, 0)
+        nn.init.normal_(m.bias, 0, 0.01)
+
 
 class PeaksTrainingSet(Dataset):
     def __init__(self, pickle_file):
@@ -86,37 +94,33 @@ class PeaksTestSet(Dataset):
 
 class ODEfunc(nn.Module):
 
-    def __init__(self, size):
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
         super(ODEfunc, self).__init__()
-        self.input = nn.Linear(3 + N_LIFTING, size)
-        # self.norm1 = nn.BatchNorm1d(size)
-        self.linear1 = nn.Linear(size + 1, size)
-        self.linear2 = nn.Linear(size + 1, size)
-        self.linear3 = nn.Linear(size + 1, size)
-        # self.norm2 = nn.BatchNorm1d(size)
-        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
-        self.relu = nn.ReLU(inplace=True)
-        # self.norm3 = nn.BatchNorm1d(2 + N_LIFTING)
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+
+        print('Number of parameters:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(activation())
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
         self.nfe = 0
 
     def forward(self, t, x):
-        tt = torch.ones_like(x[:, 0]) * t
-        tt = tt[:, None]
- 
         self.nfe += 1
-        out = self.input(torch.cat([tt, x], 1))
-        # out = self.norm1(out)
-        out = self.relu(out)
-        out = self.linear1(torch.cat([tt, out], 1))
-        # out = self.norm2(out)
-        out = self.relu(out)
-        out = self.linear2(torch.cat([tt, out], 1))
-        out = self.relu(out)
-        out = self.linear3(torch.cat([tt, out], 1))
-        out = self.relu(out)
-        out = self.output(torch.cat([tt, out], 1))
-        # out = self.norm3(out)
-        return out
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        return F.linear(x, w, b)
 
 
 class ODEBlock(nn.Module):
@@ -279,12 +283,12 @@ if __name__ == '__main__':
 
     is_odenet = args.network == 'odenet'
 
-    feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
+    feature_layers = [ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
     fc_layers = [nn.ReLU(inplace=True), nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
 
-    logger.info(model)
+    # logger.info(model)
     logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
     criterion = nn.CrossEntropyLoss().to(device)
@@ -348,7 +352,7 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % (10*batches_per_epoch) == 0:
+        if itr % (batches_per_epoch) == 0:
             with torch.no_grad():
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
