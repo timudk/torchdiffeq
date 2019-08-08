@@ -36,8 +36,9 @@ else:
 
 N_CLASSES = 5
 N_LIFTING = 6
-HYPERNET_DIM = 8
-HYPERNET_HIDDEN_LAYERS = 8
+HYPERNET_DIM = 64
+HYPERNET_HIDDEN_LAYERS = 4
+data_file = 'peaks_data/classes_5/length_6_points_12.pkl'
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -79,8 +80,10 @@ class PeaksTestSet(Dataset):
         self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
 
         for i in range(len(self.data[1])):
-            self.x[i, 0] = self.data[1][i][0]
-            self.x[i, 1] = self.data[1][i][1]
+            if N_LIFTING % 2 == 0:
+                for j in range(1 + int(N_LIFTING/2)):
+                    self.x[i, j] = self.data[1][i][j]
+                    self.x[i, j + 1] = self.data[1][i][j + 1]
             self.y[i] = self.data[1][i][2]
 
     def __len__(self):
@@ -99,7 +102,7 @@ class ODEfunc(nn.Module):
         self.dim = dim
         self.params_dim = self.dim**2 + self.dim
 
-        print('Number of parameters:', self.params_dim)
+        print('Number of parameters in output net:', self.params_dim)
 
         layers = []
         dims = [1] + [hypernet_dim] * hypernet_hidden_layers + [self.params_dim]
@@ -111,6 +114,8 @@ class ODEfunc(nn.Module):
         self._hypernet = nn.Sequential(*layers)
         self._hypernet.apply(weights_init)
 
+        print('Number of parameters in hypernet:', sum(p.numel() for p in self._hypernet.parameters() if p.requires_grad))
+
         self.nfe = 0
 
     def forward(self, t, x):
@@ -120,8 +125,8 @@ class ODEfunc(nn.Module):
         b = params[:self.dim].view(self.dim)
         w = params[self.dim:].view(self.dim, self.dim)
 
-        return 0.5*(F.linear(x, w, b) - F.linear(x, -w, b))
-
+        # return 0.5*(F.linear(x, w, b) - F.linear(x, -w, b))
+        return F.linear(x, w, b)
 
 class ODEBlock(nn.Module):
 
@@ -181,13 +186,13 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
     ])
 
     train_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
+        PeaksTrainingSet(data_file), batch_size=batch_size,
         shuffle=True, num_workers=1, drop_last=True
     )
 
 
     test_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
+        PeaksTrainingSet(data_file), batch_size=test_batch_size, 
         shuffle=False, num_workers=1, drop_last=True
     )
 
@@ -305,8 +310,8 @@ if __name__ == '__main__':
         decay_rates=[1, 0.1, 0.01, 0.001]
     )
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    # optimizer = torch.optim.Adam(model.parameters())
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -316,8 +321,8 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_fn(itr)
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
@@ -354,6 +359,8 @@ if __name__ == '__main__':
 
         if itr % (batches_per_epoch) == 0:
             with torch.no_grad():
+                train_acc = accuracy(model, train_loader)
+                print('Training accuracy:', train_acc)
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
