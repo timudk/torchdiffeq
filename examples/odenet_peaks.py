@@ -36,9 +36,10 @@ else:
 
 N_CLASSES = 5
 N_LIFTING = 1
-LAYER_WIDTH = 16
+LAYER_WIDTH = 3
 
 class PeaksTrainingSet(Dataset):
+
     def __init__(self, pickle_file):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
@@ -63,6 +64,7 @@ class PeaksTrainingSet(Dataset):
 
 
 class PeaksTestSet(Dataset):
+
     def __init__(self, pickle_file):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
@@ -306,7 +308,6 @@ if __name__ == '__main__':
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -316,8 +317,8 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        # for param_group in optimizer.param_groups:
-        #     param_group['lr'] = lr_fn(itr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()

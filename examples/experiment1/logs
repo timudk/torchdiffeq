@@ -61114,3 +61114,1647 @@ Epoch 0113
 Epoch 0114
 Epoch 0115 | Time 0.078 (0.060) | NFE-F 36.5 | NFE-B 0.0 | Test Acc 0.8139
 Epoch 0116
+/home/tudockho/Documents/torchdiffeq/examples/odenet_peaks.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import pickle
+
+import pdb
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+N_CLASSES = 5
+N_LIFTING = 1
+LAYER_WIDTH = 16
+
+class PeaksTrainingSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[0]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
+
+        for i in range(len(self.data[0])):
+            self.x[i, 0] = self.data[0][i][0]
+            self.x[i, 1] = self.data[0][i][1]
+            self.y[i] = self.data[0][i][2]
+
+        print('Number of training points:', self.__len__())
+
+    def __len__(self):
+        return len(self.data[0])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class PeaksTestSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[1]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
+
+        for i in range(len(self.data[1])):
+            self.x[i, 0] = self.data[1][i][0]
+            self.x[i, 1] = self.data[1][i][1]
+            self.y[i] = self.data[1][i][2]
+
+    def __len__(self):
+        return len(self.data[1])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, size):
+        super(ODEfunc, self).__init__()
+        self.input = nn.Linear(3 + N_LIFTING, size)
+        self.linear1 = nn.Linear(size + 1, size)
+        self.linear2 = nn.Linear(size + 1, size)
+        self.linear3 = nn.Linear(size + 1, size)
+        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
+        self.relu = nn.ReLU(inplace=True)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        x_used = x[:, :(2 + N_LIFTING)]
+        # print(x.shape)
+        # print(x_used.shape)
+
+        tt = torch.ones_like(x_used[:, 0]) * t
+        tt = tt[:, None]
+ 
+        self.nfe += 1
+        out = self.input(torch.cat([tt, x_used], 1))
+        out = self.relu(out)
+        out = self.linear1(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear2(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear3(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.output(torch.cat([tt, out], 1))
+
+
+        y_dot = x[:, (2 + N_LIFTING):]
+        # print(y_dot.shape)
+        y_dot_dot = -x[:, (2 + N_LIFTING):] + out
+        # print(y_dot_dot.shape)
+
+        return torch.cat([y_dot, y_dot_dot], 1) 
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        # print('ODEBlock forward pass.')
+
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
+        shuffle=True, num_workers=1, drop_last=True
+    )
+
+
+    test_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
+        shuffle=False, num_workers=1, drop_last=True
+    )
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        x = x.float()
+        y = one_hot(np.array(y.numpy()), N_CLASSES)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    is_odenet = args.network == 'odenet'
+
+    feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
+    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2*(2 + N_LIFTING), N_CLASSES)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader = get_peaks_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.to(device)
+        y = y.to(device)
+
+        x = x.float()
+        y = y.long()
+
+        logits = model(x)
+        # print(logits.shape)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        # pdb.set_trace()
+        # print('Loss.')
+        loss.backward()
+        # print('Optimizer step.')
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % (5*batches_per_epoch) == 0:
+            with torch.no_grad():
+                # val_acc = accuracy(model, test_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, val_acc
+                    )
+                )
+        elif itr % (batches_per_epoch) == 0 and itr % (5*batches_per_epoch) != 0:
+            logger.info(
+                    "Epoch {:04d}".format(itr // batches_per_epoch)
+                )
+
+Namespace(adjoint=False, batch_size=128, data_aug=True, debug=False, downsampling_method='conv', gpu=0, lr=0.1, nepochs=160, network='odenet', save='./experiment1', test_batch_size=1000, tol=1e-05)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (input): Linear(in_features=4, out_features=16, bias=True)
+      (linear1): Linear(in_features=17, out_features=16, bias=True)
+      (linear2): Linear(in_features=17, out_features=16, bias=True)
+      (linear3): Linear(in_features=17, out_features=16, bias=True)
+      (output): Linear(in_features=17, out_features=3, bias=True)
+      (relu): ReLU(inplace)
+    )
+  )
+  (1): ReLU(inplace)
+  (2): Linear(in_features=6, out_features=5, bias=True)
+)
+Number of parameters: 1033
+Epoch 0000 | Time 0.061 (0.061) | NFE-F 26.0 | NFE-B 0.0 | Test Acc 0.3186
+Epoch 0001
+Epoch 0002
+Epoch 0003
+Epoch 0004
+Epoch 0005 | Time 0.085 (0.057) | NFE-F 32.1 | NFE-B 0.0 | Test Acc 0.3439
+Epoch 0006
+Epoch 0007
+Epoch 0008
+Epoch 0009
+Epoch 0010 | Time 0.105 (0.069) | NFE-F 41.7 | NFE-B 0.0 | Test Acc 0.4900
+Epoch 0011
+Epoch 0012
+Epoch 0013
+Epoch 0014
+Epoch 0015 | Time 0.112 (0.080) | NFE-F 49.3 | NFE-B 0.0 | Test Acc 0.5582
+Epoch 0016
+Epoch 0017
+/home/tudockho/Documents/torchdiffeq/examples/odenet_peaks.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import pickle
+
+import pdb
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+N_CLASSES = 5
+N_LIFTING = 1
+LAYER_WIDTH = 6
+
+class PeaksTrainingSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[0]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
+
+        for i in range(len(self.data[0])):
+            self.x[i, 0] = self.data[0][i][0]
+            self.x[i, 1] = self.data[0][i][1]
+            self.y[i] = self.data[0][i][2]
+
+        print('Number of training points:', self.__len__())
+
+    def __len__(self):
+        return len(self.data[0])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class PeaksTestSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[1]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
+
+        for i in range(len(self.data[1])):
+            self.x[i, 0] = self.data[1][i][0]
+            self.x[i, 1] = self.data[1][i][1]
+            self.y[i] = self.data[1][i][2]
+
+    def __len__(self):
+        return len(self.data[1])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, size):
+        super(ODEfunc, self).__init__()
+        self.input = nn.Linear(3 + N_LIFTING, size)
+        self.linear1 = nn.Linear(size + 1, size)
+        self.linear2 = nn.Linear(size + 1, size)
+        self.linear3 = nn.Linear(size + 1, size)
+        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
+        self.relu = nn.ReLU(inplace=True)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        x_used = x[:, :(2 + N_LIFTING)]
+        # print(x.shape)
+        # print(x_used.shape)
+
+        tt = torch.ones_like(x_used[:, 0]) * t
+        tt = tt[:, None]
+ 
+        self.nfe += 1
+        out = self.input(torch.cat([tt, x_used], 1))
+        out = self.relu(out)
+        out = self.linear1(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear2(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear3(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.output(torch.cat([tt, out], 1))
+
+
+        y_dot = x[:, (2 + N_LIFTING):]
+        # print(y_dot.shape)
+        y_dot_dot = -x[:, (2 + N_LIFTING):] + out
+        # print(y_dot_dot.shape)
+
+        return torch.cat([y_dot, y_dot_dot], 1) 
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        # print('ODEBlock forward pass.')
+
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
+        shuffle=True, num_workers=1, drop_last=True
+    )
+
+
+    test_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
+        shuffle=False, num_workers=1, drop_last=True
+    )
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        x = x.float()
+        y = one_hot(np.array(y.numpy()), N_CLASSES)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    is_odenet = args.network == 'odenet'
+
+    feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
+    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2*(2 + N_LIFTING), N_CLASSES)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader = get_peaks_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.to(device)
+        y = y.to(device)
+
+        x = x.float()
+        y = y.long()
+
+        logits = model(x)
+        # print(logits.shape)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        # pdb.set_trace()
+        # print('Loss.')
+        loss.backward()
+        # print('Optimizer step.')
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % (5*batches_per_epoch) == 0:
+            with torch.no_grad():
+                # val_acc = accuracy(model, test_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, val_acc
+                    )
+                )
+        elif itr % (batches_per_epoch) == 0 and itr % (5*batches_per_epoch) != 0:
+            logger.info(
+                    "Epoch {:04d}".format(itr // batches_per_epoch)
+                )
+
+Namespace(adjoint=False, batch_size=128, data_aug=True, debug=False, downsampling_method='conv', gpu=0, lr=0.1, nepochs=160, network='odenet', save='./experiment1', test_batch_size=1000, tol=1e-05)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (input): Linear(in_features=4, out_features=6, bias=True)
+      (linear1): Linear(in_features=7, out_features=6, bias=True)
+      (linear2): Linear(in_features=7, out_features=6, bias=True)
+      (linear3): Linear(in_features=7, out_features=6, bias=True)
+      (output): Linear(in_features=7, out_features=3, bias=True)
+      (relu): ReLU(inplace)
+    )
+  )
+  (1): ReLU(inplace)
+  (2): Linear(in_features=6, out_features=5, bias=True)
+)
+Number of parameters: 233
+Epoch 0000 | Time 0.070 (0.070) | NFE-F 32.0 | NFE-B 0.0 | Test Acc 0.1631
+Epoch 0001
+Epoch 0002
+Epoch 0003
+Epoch 0004
+Epoch 0005 | Time 0.072 (0.054) | NFE-F 32.3 | NFE-B 0.0 | Test Acc 0.2988
+Epoch 0006
+Epoch 0007
+Epoch 0008
+Epoch 0009
+Epoch 0010 | Time 0.115 (0.064) | NFE-F 39.3 | NFE-B 0.0 | Test Acc 0.3518
+Epoch 0011
+/home/tudockho/Documents/torchdiffeq/examples/odenet_peaks.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import pickle
+
+import pdb
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+N_CLASSES = 5
+N_LIFTING = 1
+LAYER_WIDTH = 3
+
+class PeaksTrainingSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[0]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
+
+        for i in range(len(self.data[0])):
+            self.x[i, 0] = self.data[0][i][0]
+            self.x[i, 1] = self.data[0][i][1]
+            self.y[i] = self.data[0][i][2]
+
+        print('Number of training points:', self.__len__())
+
+    def __len__(self):
+        return len(self.data[0])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class PeaksTestSet(Dataset):
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[1]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
+
+        for i in range(len(self.data[1])):
+            self.x[i, 0] = self.data[1][i][0]
+            self.x[i, 1] = self.data[1][i][1]
+            self.y[i] = self.data[1][i][2]
+
+    def __len__(self):
+        return len(self.data[1])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, size):
+        super(ODEfunc, self).__init__()
+        self.input = nn.Linear(3 + N_LIFTING, size)
+        self.linear1 = nn.Linear(size + 1, size)
+        self.linear2 = nn.Linear(size + 1, size)
+        self.linear3 = nn.Linear(size + 1, size)
+        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
+        self.relu = nn.ReLU(inplace=True)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        x_used = x[:, :(2 + N_LIFTING)]
+        # print(x.shape)
+        # print(x_used.shape)
+
+        tt = torch.ones_like(x_used[:, 0]) * t
+        tt = tt[:, None]
+ 
+        self.nfe += 1
+        out = self.input(torch.cat([tt, x_used], 1))
+        out = self.relu(out)
+        out = self.linear1(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear2(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear3(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.output(torch.cat([tt, out], 1))
+
+
+        y_dot = x[:, (2 + N_LIFTING):]
+        # print(y_dot.shape)
+        y_dot_dot = -x[:, (2 + N_LIFTING):] + out
+        # print(y_dot_dot.shape)
+
+        return torch.cat([y_dot, y_dot_dot], 1) 
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        # print('ODEBlock forward pass.')
+
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
+        shuffle=True, num_workers=1, drop_last=True
+    )
+
+
+    test_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
+        shuffle=False, num_workers=1, drop_last=True
+    )
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        x = x.float()
+        y = one_hot(np.array(y.numpy()), N_CLASSES)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    is_odenet = args.network == 'odenet'
+
+    feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
+    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2*(2 + N_LIFTING), N_CLASSES)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader = get_peaks_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters())
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.to(device)
+        y = y.to(device)
+
+        x = x.float()
+        y = y.long()
+
+        logits = model(x)
+        # print(logits.shape)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        # pdb.set_trace()
+        # print('Loss.')
+        loss.backward()
+        # print('Optimizer step.')
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % (5*batches_per_epoch) == 0:
+            with torch.no_grad():
+                # val_acc = accuracy(model, test_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, val_acc
+                    )
+                )
+        elif itr % (batches_per_epoch) == 0 and itr % (5*batches_per_epoch) != 0:
+            logger.info(
+                    "Epoch {:04d}".format(itr // batches_per_epoch)
+                )
+
+Namespace(adjoint=False, batch_size=128, data_aug=True, debug=False, downsampling_method='conv', gpu=0, lr=0.1, nepochs=160, network='odenet', save='./experiment1', test_batch_size=1000, tol=1e-05)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (input): Linear(in_features=4, out_features=3, bias=True)
+      (linear1): Linear(in_features=4, out_features=3, bias=True)
+      (linear2): Linear(in_features=4, out_features=3, bias=True)
+      (linear3): Linear(in_features=4, out_features=3, bias=True)
+      (output): Linear(in_features=4, out_features=3, bias=True)
+      (relu): ReLU(inplace)
+    )
+  )
+  (1): ReLU(inplace)
+  (2): Linear(in_features=6, out_features=5, bias=True)
+)
+Number of parameters: 110
+Epoch 0000 | Time 0.061 (0.061) | NFE-F 26.0 | NFE-B 0.0 | Test Acc 0.1564
+Epoch 0001
+Epoch 0002
+Epoch 0003
+Epoch 0004
+Epoch 0005 | Time 0.061 (0.044) | NFE-F 26.3 | NFE-B 0.0 | Test Acc 0.2930
+Epoch 0006
+Epoch 0007
+Epoch 0008
+Epoch 0009
+Epoch 0010 | Time 0.058 (0.042) | NFE-F 26.7 | NFE-B 0.0 | Test Acc 0.3053
+Epoch 0011
+Epoch 0012
+Epoch 0013
+Epoch 0014
+Epoch 0015 | Time 0.069 (0.050) | NFE-F 32.9 | NFE-B 0.0 | Test Acc 0.3725
+Epoch 0016
+Epoch 0017
+Epoch 0018
+Epoch 0019
+Epoch 0020 | Time 0.080 (0.057) | NFE-F 37.4 | NFE-B 0.0 | Test Acc 0.4045
+Epoch 0021
+Epoch 0022
+Epoch 0023
+Epoch 0024
+Epoch 0025 | Time 0.087 (0.062) | NFE-F 41.3 | NFE-B 0.0 | Test Acc 0.4631
+Epoch 0026
+Epoch 0027
+Epoch 0028
+Epoch 0029
+Epoch 0030 | Time 0.112 (0.072) | NFE-F 47.4 | NFE-B 0.0 | Test Acc 0.5008
+Epoch 0031
+Epoch 0032
+Epoch 0033
+Epoch 0034
+Epoch 0035 | Time 0.097 (0.077) | NFE-F 51.3 | NFE-B 0.0 | Test Acc 0.5125
+/home/tudockho/Documents/torchdiffeq/examples/odenet_peaks.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from torch.utils.data import Dataset
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+import pickle
+
+import pdb
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+N_CLASSES = 5
+N_LIFTING = 1
+LAYER_WIDTH = 3
+
+class PeaksTrainingSet(Dataset):
+
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[0]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
+
+        for i in range(len(self.data[0])):
+            self.x[i, 0] = self.data[0][i][0]
+            self.x[i, 1] = self.data[0][i][1]
+            self.y[i] = self.data[0][i][2]
+
+        print('Number of training points:', self.__len__())
+
+    def __len__(self):
+        return len(self.data[0])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class PeaksTestSet(Dataset):
+
+    def __init__(self, pickle_file):
+        with open(pickle_file, 'rb') as f:
+            self.data = pickle.load(f)
+
+        self.x = np.zeros((len(self.data[1]), 2*(2 + N_LIFTING)))
+        self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
+
+        for i in range(len(self.data[1])):
+            self.x[i, 0] = self.data[1][i][0]
+            self.x[i, 1] = self.data[1][i][1]
+            self.y[i] = self.data[1][i][2]
+
+    def __len__(self):
+        return len(self.data[1])
+
+    def __getitem__(self, idx):
+        sample = (self.x[idx], self.y[idx])
+
+        return sample
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, size):
+        super(ODEfunc, self).__init__()
+        self.input = nn.Linear(3 + N_LIFTING, size)
+        self.linear1 = nn.Linear(size + 1, size)
+        self.linear2 = nn.Linear(size + 1, size)
+        self.linear3 = nn.Linear(size + 1, size)
+        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
+        self.relu = nn.ReLU(inplace=True)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        x_used = x[:, :(2 + N_LIFTING)]
+        # print(x.shape)
+        # print(x_used.shape)
+
+        tt = torch.ones_like(x_used[:, 0]) * t
+        tt = tt[:, None]
+ 
+        self.nfe += 1
+        out = self.input(torch.cat([tt, x_used], 1))
+        out = self.relu(out)
+        out = self.linear1(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear2(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.linear3(torch.cat([tt, out], 1))
+        out = self.relu(out)
+        out = self.output(torch.cat([tt, out], 1))
+
+
+        y_dot = x[:, (2 + N_LIFTING):]
+        # print(y_dot.shape)
+        y_dot_dot = -x[:, (2 + N_LIFTING):] + out
+        # print(y_dot_dot.shape)
+
+        return torch.cat([y_dot, y_dot_dot], 1) 
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        # print('ODEBlock forward pass.')
+
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
+        shuffle=True, num_workers=1, drop_last=True
+    )
+
+
+    test_loader = DataLoader(
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
+        shuffle=False, num_workers=1, drop_last=True
+    )
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        x = x.float()
+        y = one_hot(np.array(y.numpy()), N_CLASSES)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+    is_odenet = args.network == 'odenet'
+
+    feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
+    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2*(2 + N_LIFTING), N_CLASSES)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader = get_peaks_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.to(device)
+        y = y.to(device)
+
+        x = x.float()
+        y = y.long()
+
+        logits = model(x)
+        # print(logits.shape)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        # pdb.set_trace()
+        # print('Loss.')
+        loss.backward()
+        # print('Optimizer step.')
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % (5*batches_per_epoch) == 0:
+            with torch.no_grad():
+                # val_acc = accuracy(model, test_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, val_acc
+                    )
+                )
+        elif itr % (batches_per_epoch) == 0 and itr % (5*batches_per_epoch) != 0:
+            logger.info(
+                    "Epoch {:04d}".format(itr // batches_per_epoch)
+                )
+
+Namespace(adjoint=False, batch_size=128, data_aug=True, debug=False, downsampling_method='conv', gpu=0, lr=0.1, nepochs=160, network='odenet', save='./experiment1', test_batch_size=1000, tol=1e-05)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (input): Linear(in_features=4, out_features=3, bias=True)
+      (linear1): Linear(in_features=4, out_features=3, bias=True)
+      (linear2): Linear(in_features=4, out_features=3, bias=True)
+      (linear3): Linear(in_features=4, out_features=3, bias=True)
+      (output): Linear(in_features=4, out_features=3, bias=True)
+      (relu): ReLU(inplace)
+    )
+  )
+  (1): ReLU(inplace)
+  (2): Linear(in_features=6, out_features=5, bias=True)
+)
+Number of parameters: 110
+Epoch 0000 | Time 0.058 (0.058) | NFE-F 26.0 | NFE-B 0.0 | Test Acc 0.1516
+Epoch 0001
+Epoch 0002
+Epoch 0003
+Epoch 0004
+Epoch 0005 | Time 0.061 (0.043) | NFE-F 26.3 | NFE-B 0.0 | Test Acc 0.4371
+Epoch 0006
+Epoch 0007
+Epoch 0008
+Epoch 0009
+Epoch 0010 | Time 0.058 (0.052) | NFE-F 34.0 | NFE-B 0.0 | Test Acc 0.2746
+Epoch 0011
+Epoch 0012
+Epoch 0013
+Epoch 0014
+Epoch 0015 | Time 0.059 (0.043) | NFE-F 27.2 | NFE-B 0.0 | Test Acc 0.4445
+Epoch 0016
