@@ -24,7 +24,7 @@ parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False]
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--test_batch_size', type=int, default=1000)
-parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--save', type=str, default='NONE')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
@@ -35,7 +35,7 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 5
-N_LIFTING = 2
+N_LIFTING = 6
 HYPERNET_DIM = 8
 HYPERNET_HIDDEN_LAYERS = 8
 
@@ -181,13 +181,13 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
     ])
 
     train_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=batch_size,
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=batch_size,
         shuffle=True, num_workers=1, drop_last=True
     )
 
 
     test_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=test_batch_size, 
+        PeaksTrainingSet('peaks_data/classes_5/length_6_points_80.pkl'), batch_size=test_batch_size, 
         shuffle=False, num_workers=1, drop_last=True
     )
 
@@ -275,21 +275,21 @@ def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True
 
 if __name__ == '__main__':
 
-    makedirs(args.save)
-    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
-    logger.info(args)
+    # makedirs(args.save)
+    # logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    # logger.info(args)
 
     device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
 
     is_odenet = args.network == 'odenet'
 
     feature_layers = [ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
-    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2 + N_LIFTING, N_CLASSES)]
+    fc_layers = [nn.Tanh(), nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
 
-    logger.info(model)
-    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+    # logger.info(model)
+    # logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
     criterion = nn.CrossEntropyLoss().to(device)
 
@@ -305,8 +305,8 @@ if __name__ == '__main__':
         decay_rates=[1, 0.1, 0.01, 0.001]
     )
 
-    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    # optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -316,8 +316,8 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        # for param_group in optimizer.param_groups:
-        #     param_group['lr'] = lr_fn(itr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
@@ -357,12 +357,18 @@ if __name__ == '__main__':
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    if args.save != 'NONE':
+                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
                     best_acc = val_acc
-                logger.info(
-                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Test Acc {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, val_acc
+                #     )
+                # )
+                print("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
                     "Test Acc {:.4f}".format(
                         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
                         b_nfe_meter.avg, val_acc
-                    )
-                )
+                    ))
