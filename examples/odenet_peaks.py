@@ -120,7 +120,7 @@ class ODEfunc(nn.Module):
         b = params[:self.dim].view(self.dim)
         w = params[self.dim:].view(self.dim, self.dim)
 
-        return F.linear(x, w, b)
+        return 0.5*(F.linear(x, w, b) - F.linear(x, -w, b))
 
 
 class ODEBlock(nn.Module):
@@ -288,7 +288,7 @@ if __name__ == '__main__':
 
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
 
-    # logger.info(model)
+    logger.info(model)
     logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
     criterion = nn.CrossEntropyLoss().to(device)
@@ -305,7 +305,7 @@ if __name__ == '__main__':
         decay_rates=[1, 0.1, 0.01, 0.001]
     )
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
     optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
