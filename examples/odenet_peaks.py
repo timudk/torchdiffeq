@@ -10,16 +10,21 @@ from torch.utils.data import Dataset
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import pickle
+import matplotlib.pyplot as plt
 
 import pdb
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--network', type=str,
+                    choices=['resnet', 'odenet'], default='odenet')
 parser.add_argument('--tol', type=float, default=1e-3)
-parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
-parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str,
+                    default='conv', choices=['conv', 'res'])
 parser.add_argument('--nepochs', type=int, default=160)
-parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--data_aug', type=eval,
+                    default=True, choices=[True, False])
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--test_batch_size', type=int, default=1000)
@@ -34,30 +39,40 @@ if args.adjoint:
 else:
     from torchdiffeq import odeint
 
-N_CLASSES = 5
-N_LIFTING = 5
+N_CLASSES = 2
+N_LIFTING = 0
 LAYER_WIDTH = 16
+PRINT_INPUT = True
+PRINT_OUTPUT = True
+
+torch.autograd.set_detect_anomaly(True)
+
 
 class PeaksTrainingSet(Dataset):
     def __init__(self, pickle_file):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
 
-        self.x = np.zeros((len(self.data[0]), 2 + N_LIFTING))
-        self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
+        self.x_data = np.zeros(
+            (len(self.data[0]), 2 + N_LIFTING), dtype=np.float32)
+        self.y = np.zeros((len(self.data[0]),), dtype=np.int64)
 
         for i in range(len(self.data[0])):
-            self.x[i, 0] = self.data[0][i][0]
-            self.x[i, 1] = self.data[0][i][1]
+            self.x_data[i, 0] = self.data[0][i][0]
+            self.x_data[i, 1] = self.data[0][i][1]
             self.y[i] = self.data[0][i][2]
 
         print('Number of training points:', self.__len__())
+
+        if PRINT_INPUT == True:
+            plt.scatter(self.x_data[:, 0], self.x_data[:, 1], c=self.y[:])
+            plt.show()
 
     def __len__(self):
         return len(self.data[0])
 
     def __getitem__(self, idx):
-        sample = (self.x[idx], self.y[idx])
+        sample = (self.x_data[idx], self.y[idx])
 
         return sample
 
@@ -67,55 +82,60 @@ class PeaksTestSet(Dataset):
         with open(pickle_file, 'rb') as f:
             self.data = pickle.load(f)
 
-        self.x = np.zeros((len(self.data[1]), 2 + N_LIFTING))
-        self.y = np.zeros((len(self.data[1]),), dtype=np.int32)
+        self.x_data = np.zeros(
+            (len(self.data[1]), 2 + N_LIFTING), dtype=np.float32)
+        self.y = np.zeros((len(self.data[1]),), dtype=np.int64)
 
         for i in range(len(self.data[1])):
-            self.x[i, 0] = self.data[1][i][0]
-            self.x[i, 1] = self.data[1][i][1]
+            self.x_data[i, 0] = self.data[1][i][0]
+            self.x_data[i, 1] = self.data[1][i][1]
             self.y[i] = self.data[1][i][2]
 
     def __len__(self):
         return len(self.data[1])
 
     def __getitem__(self, idx):
-        sample = (self.x[idx], self.y[idx])
+        sample = (self.x_data[idx], self.y[idx])
 
         return sample
+
+
+class ConcatLinear(nn.Module):
+
+    def __init__(self, dim_in, dim_out, use_bias=True):
+        super(ConcatLinear, self).__init__()
+        self._layer = nn.Linear(dim_in + 1, dim_out, bias=use_bias)
+
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1]) * t
+        ttx = torch.cat([tt, x], 1)
+        return self._layer(ttx)
 
 
 class ODEfunc(nn.Module):
 
     def __init__(self, size):
         super(ODEfunc, self).__init__()
-        self.input = nn.Linear(3 + N_LIFTING, size)
-        # self.norm1 = nn.BatchNorm1d(size)
-        self.linear1 = nn.Linear(size + 1, size)
-        self.linear2 = nn.Linear(size + 1, size)
-        self.linear3 = nn.Linear(size + 1, size)
-        # self.norm2 = nn.BatchNorm1d(size)
-        self.output = nn.Linear(size + 1, 2 + N_LIFTING)
-        self.relu = nn.ReLU(inplace=True)
-        # self.norm3 = nn.BatchNorm1d(2 + N_LIFTING)
+
+        self.fc1 = ConcatLinear(2 + N_LIFTING, 16)
+        self.fc2 = ConcatLinear(16, 16)
+        self.fc3 = ConcatLinear(16, 16)
+        self.fc4 = ConcatLinear(16, 2 + N_LIFTING)
+
+        self.activation = torch.nn.Tanh()
         self.nfe = 0
 
     def forward(self, t, x):
-        tt = torch.ones_like(x[:, 0]) * t
-        tt = tt[:, None]
- 
         self.nfe += 1
-        out = self.input(torch.cat([tt, x], 1))
-        # out = self.norm1(out)
-        out = self.relu(out)
-        out = self.linear1(torch.cat([tt, out], 1))
-        # out = self.norm2(out)
-        out = self.relu(out)
-        out = self.linear2(torch.cat([tt, out], 1))
-        out = self.relu(out)
-        out = self.linear3(torch.cat([tt, out], 1))
-        out = self.relu(out)
-        out = self.output(torch.cat([tt, out], 1))
-        # out = self.norm3(out)
+
+        out = self.fc1(t, x)
+        out = self.activation(out)
+        out = self.fc2(t, out)
+        out = self.activation(out)
+        out = self.fc3(t, out)
+        out = self.activation(out)
+        out = self.fc4(t, out)
+
         return out
 
 
@@ -128,9 +148,11 @@ class ODEBlock(nn.Module):
 
     def forward(self, x):
         # print('ODEBlock forward pass.')
-
+        # pdb.set_trace()
+        # print(x)
         self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
         return out[1]
 
     @property
@@ -177,13 +199,12 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
     ])
 
     train_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=batch_size,
+        PeaksTrainingSet('peaks_data/classes_2/length_6_points_12.pkl'), batch_size=batch_size,
         shuffle=True, num_workers=1, drop_last=True
     )
 
-
     test_loader = DataLoader(
-        PeaksTrainingSet('peaks_data/classes_5/length_6_points_200.pkl'), batch_size=test_batch_size, 
+        PeaksTestSet('peaks_data/classes_2/length_6_points_12.pkl'), batch_size=test_batch_size,
         shuffle=False, num_workers=1, drop_last=True
     )
 
@@ -272,18 +293,20 @@ def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True
 if __name__ == '__main__':
 
     makedirs(args.save)
-    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
     logger.info(args)
 
-    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
 
     is_odenet = args.network == 'odenet'
 
     feature_layers = [ODEBlock(ODEfunc(LAYER_WIDTH))]
-    fc_layers = [nn.ReLU(inplace=True), nn.Linear(2 + N_LIFTING, N_CLASSES)]
+    # fc_layers = [nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
-    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
-
+    # model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+    model = nn.Sequential(*feature_layers).to(device)
     logger.info(model)
     logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
@@ -302,7 +325,7 @@ if __name__ == '__main__':
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    optimizer = torch.optim.Adam(model.parameters())
+    # optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -312,28 +335,34 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        # for param_group in optimizer.param_groups:
-        #     param_group['lr'] = lr_fn(itr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
+        # print(x.shape)
+
+        # x = x.float()
+        # y = y.long()
 
         x = x.to(device)
         y = y.to(device)
 
-        x = x.float()
-        y = y.long()
-
+        # pdb.set_trace()
         logits = model(x)
         # print(logits.shape)
         loss = criterion(logits, y)
+
+        # print(model[0](x).shape)
 
         if is_odenet:
             nfe_forward = feature_layers[0].nfe
             feature_layers[0].nfe = 0
 
+        # print('Bla:', x.shape)
         # pdb.set_trace()
         # print('Loss.')
+        # pdb.set_trace()
         loss.backward()
         # print('Optimizer step.')
         optimizer.step()
@@ -348,12 +377,18 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % (10*batches_per_epoch) == 0:
+        if itr % (10* batches_per_epoch) == 0:
             with torch.no_grad():
-                # val_acc = accuracy(model, test_loader)
+
+                if PRINT_OUTPUT == True:
+                    plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
+                    plt.show()
+                train_acc = accuracy(model, train_loader)
+                print('Train accuracy:', train_acc)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(
+                        args.save, 'model.pth'))
                     best_acc = val_acc
                 logger.info(
                     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
