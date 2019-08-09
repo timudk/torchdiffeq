@@ -11,16 +11,21 @@ from torch.utils.data import Dataset
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 import pickle
+import matplotlib.pyplot as plt
 
 import pdb
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--network', type=str,
+                    choices=['resnet', 'odenet'], default='odenet')
 parser.add_argument('--tol', type=float, default=1e-3)
-parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
-parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str,
+                    default='conv', choices=['conv', 'res'])
 parser.add_argument('--nepochs', type=int, default=160)
-parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--data_aug', type=eval,
+                    default=True, choices=[True, False])
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--test_batch_size', type=int, default=1000)
@@ -34,17 +39,18 @@ if args.adjoint:
 else:
     from torchdiffeq import odeint
 
-N_CLASSES = 5
-N_LIFTING = 6
-HYPERNET_DIM = 64
-HYPERNET_HIDDEN_LAYERS = 4
-data_file = 'peaks_data/classes_5/length_6_points_12.pkl'
+N_CLASSES = 2
+N_LIFTING = 0
+HYPERNET_DIM = 16
+HYPERNET_HIDDEN_LAYERS = 8
+data_file = 'peaks_data/classes_2/length_6_points_12.pkl'
+
 
 def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1 or classname.find('Conv') != -1:
-        nn.init.constant_(m.weight, 0)
-        nn.init.normal_(m.bias, 0, 0.01)
+        nn.init.normal_(m.weight, 0, 0.1)
+        nn.init.normal_(m.bias, 0, 0.1)
 
 
 class PeaksTrainingSet(Dataset):
@@ -56,9 +62,14 @@ class PeaksTrainingSet(Dataset):
         self.y = np.zeros((len(self.data[0]),), dtype=np.int32)
 
         for i in range(len(self.data[0])):
-            self.x[i, 0] = self.data[0][i][0]
-            self.x[i, 1] = self.data[0][i][1]
+            if N_LIFTING % 2 == 0:
+                for j in range(1 + int(N_LIFTING / 2)):
+                    self.x[i, j] = self.data[0][i][0]
+                    self.x[i, j + 1] = self.data[0][i][1]
             self.y[i] = self.data[0][i][2]
+
+        plt.scatter(self.x[:, 0], self.x[:, 1], c=self.y[:])
+        plt.show()
 
         print('Number of training points:', self.__len__())
 
@@ -81,7 +92,7 @@ class PeaksTestSet(Dataset):
 
         for i in range(len(self.data[1])):
             if N_LIFTING % 2 == 0:
-                for j in range(1 + int(N_LIFTING/2)):
+                for j in range(1 + int(N_LIFTING / 2)):
                     self.x[i, j] = self.data[1][i][j]
                     self.x[i, j + 1] = self.data[1][i][j + 1]
             self.y[i] = self.data[1][i][2]
@@ -105,7 +116,8 @@ class ODEfunc(nn.Module):
         print('Number of parameters in output net:', self.params_dim)
 
         layers = []
-        dims = [1] + [hypernet_dim] * hypernet_hidden_layers + [self.params_dim]
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
 
         for i in range(1, len(dims)):
             layers.append(nn.Linear(dims[i - 1], dims[i]))
@@ -114,7 +126,8 @@ class ODEfunc(nn.Module):
         self._hypernet = nn.Sequential(*layers)
         self._hypernet.apply(weights_init)
 
-        print('Number of parameters in hypernet:', sum(p.numel() for p in self._hypernet.parameters() if p.requires_grad))
+        print('Number of parameters in hypernet:', sum(p.numel()
+                                                       for p in self._hypernet.parameters() if p.requires_grad))
 
         self.nfe = 0
 
@@ -124,9 +137,11 @@ class ODEfunc(nn.Module):
         params = self._hypernet(t.view(1, 1)).view(-1)
         b = params[:self.dim].view(self.dim)
         w = params[self.dim:].view(self.dim, self.dim)
+        # print(w)
 
         # return 0.5*(F.linear(x, w, b) - F.linear(x, -w, b))
         return F.linear(x, w, b)
+
 
 class ODEBlock(nn.Module):
 
@@ -139,7 +154,8 @@ class ODEBlock(nn.Module):
         # print('ODEBlock forward pass.')
 
         self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
         return out[1]
 
     @property
@@ -190,9 +206,8 @@ def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc
         shuffle=True, num_workers=1, drop_last=True
     )
 
-
     test_loader = DataLoader(
-        PeaksTrainingSet(data_file), batch_size=test_batch_size, 
+        PeaksTrainingSet(data_file), batch_size=test_batch_size,
         shuffle=False, num_workers=1, drop_last=True
     )
 
@@ -284,13 +299,16 @@ if __name__ == '__main__':
     # logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
     # logger.info(args)
 
-    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
 
     is_odenet = args.network == 'odenet'
 
-    feature_layers = [ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
+    feature_layers = [
+        ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
     fc_layers = [nn.Tanh(), nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
+    # model = nn.Sequential(*feature_layers, *fc_layers).to(device)
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
 
     # logger.info(model)
@@ -305,13 +323,13 @@ if __name__ == '__main__':
     data_gen = inf_generator(train_loader)
     batches_per_epoch = len(train_loader)
 
-    lr_fn = learning_rate_with_decay(
-        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
-        decay_rates=[1, 0.1, 0.01, 0.001]
-    )
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
 
-    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    optimizer = torch.optim.Adam(model.parameters())
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    # optimizer = torch.optim.Adam(model.parameters())
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -336,6 +354,7 @@ if __name__ == '__main__':
         logits = model(x)
         # print(logits.shape)
         loss = criterion(logits, y)
+        print('Loss:', loss)
 
         if is_odenet:
             nfe_forward = feature_layers[0].nfe
@@ -357,15 +376,18 @@ if __name__ == '__main__':
             b_nfe_meter.update(nfe_backward)
         end = time.time()
 
-        if itr % (batches_per_epoch) == 0:
+        if itr % (10 * batches_per_epoch) == 0:
             with torch.no_grad():
+                plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
+                plt.show()
                 train_acc = accuracy(model, train_loader)
                 print('Training accuracy:', train_acc)
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
                     if args.save != 'NONE':
-                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
+                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(
+                            args.save, 'model.pth'))
                     best_acc = val_acc
                 # logger.info(
                 #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
@@ -375,7 +397,7 @@ if __name__ == '__main__':
                 #     )
                 # )
                 print("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                    "Test Acc {:.4f}".format(
-                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                        b_nfe_meter.avg, val_acc
-                    ))
+                      "Test Acc {:.4f}".format(
+                          itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                          b_nfe_meter.avg, val_acc
+                      ))
