@@ -9,7 +9,6 @@ from torch.utils.data import DataLoader
 
 from sklearn import datasets
 from sklearn import preprocessing
-import pdb
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--tol', type=float, default=1e-3)
@@ -190,7 +189,6 @@ def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundar
 
 
 def compute_loss(loss_func, model, dataset_loader):
-	# pdb.set_trace()
 	for x, y in dataset_loader:
 		x = x.float().to(device)
 		y = y.float().to(device)
