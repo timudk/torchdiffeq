@@ -31,6 +31,8 @@ if args.adjoint:
 else:
     from torchdiffeq import odeint
 
+#python3 odenet_boston.py --hyper_dim 256 --hyper_hidden 2 --lr 0.01
+
 
 class ODEfunc(nn.Module):
 
@@ -63,7 +65,7 @@ class ODEfunc(nn.Module):
         b = params[:self.dim].view(self.dim)
         w = params[self.dim:].view(self.dim, self.dim)
 
-        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w, b))
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
         # out = nn.functional.linear(x, w, b)
 
         return nn.functional.tanh(out)

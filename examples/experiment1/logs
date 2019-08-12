@@ -36840,3 +36840,4117 @@ Epoch 0319 | Time 0.192 (0.182) | NFE-F 38.9 | NFE-B 30.7 | Train Loss 25.2983
 Epoch 0320 | Time 0.192 (0.182) | NFE-F 38.9 | NFE-B 30.8 | Train Loss 25.2951
 Epoch 0321 | Time 0.194 (0.182) | NFE-F 38.9 | NFE-B 30.8 | Train Loss 25.2919
 Epoch 0322 | Time 0.199 (0.182) | NFE-F 38.9 | NFE-B 30.8 | Train Loss 25.2886
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=8, hyper_hidden=8, lr=0.1, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=8, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=8, out_features=8, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=8, out_features=8, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=8, out_features=8, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=8, out_features=8, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=8, out_features=8, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=8, out_features=8, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=8, out_features=8, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=8, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 2172
+Epoch 0000 | Time 0.049 (0.049) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 3907.4031
+Epoch 0001 | Time 0.090 (0.049) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 495.5300
+Epoch 0002 | Time 0.086 (0.050) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 604.1257
+Epoch 0003 | Time 0.080 (0.050) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 1975.4950
+Epoch 0004 | Time 0.082 (0.050) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 1298.2194
+Epoch 0005 | Time 0.082 (0.051) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 177.0814
+Epoch 0006 | Time 0.082 (0.051) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 182.3425
+Epoch 0007 | Time 0.079 (0.051) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 899.9203
+Epoch 0008 | Time 0.082 (0.052) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 1042.2947
+Epoch 0009 | Time 0.079 (0.052) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 493.1918
+Epoch 0010 | Time 0.082 (0.052) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 38.9476
+Epoch 0011 | Time 0.083 (0.052) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 164.4058
+Epoch 0012 | Time 0.078 (0.053) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 544.7285
+Epoch 0013 | Time 0.083 (0.053) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 603.9983
+Epoch 0014 | Time 0.081 (0.053) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 297.3031
+Epoch 0015 | Time 0.083 (0.054) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 32.4797
+Epoch 0016 | Time 0.080 (0.054) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 90.6006
+Epoch 0017 | Time 0.078 (0.054) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 313.8566
+Epoch 0018 | Time 0.082 (0.054) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 370.0687
+Epoch 0019 | Time 0.081 (0.055) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 198.3289
+Epoch 0020 | Time 0.083 (0.055) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 29.8525
+Epoch 0021 | Time 0.079 (0.055) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 52.9485
+Epoch 0022 | Time 0.081 (0.055) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 188.5224
+Epoch 0023 | Time 0.081 (0.056) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 229.8854
+Epoch 0024 | Time 0.081 (0.056) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 130.9089
+Epoch 0025 | Time 0.078 (0.056) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 32.7500
+Epoch 0026 | Time 0.084 (0.056) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 31.4711
+Epoch 0027 | Time 0.080 (0.057) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 121.8105
+Epoch 0028 | Time 0.082 (0.057) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 158.7517
+Epoch 0029 | Time 0.078 (0.057) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 92.9543
+Epoch 0030 | Time 0.080 (0.057) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 20.3174
+Epoch 0031 | Time 0.082 (0.058) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 30.8784
+Epoch 0032 | Time 0.083 (0.058) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 88.6331
+Epoch 0033 | Time 0.084 (0.058) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 99.5411
+Epoch 0034 | Time 0.080 (0.058) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 50.2808
+Epoch 0035 | Time 0.082 (0.059) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 13.7200
+Epoch 0036 | Time 0.084 (0.059) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 33.6035
+Epoch 0037 | Time 0.083 (0.059) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 67.2576
+Epoch 0038 | Time 0.082 (0.059) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 59.7293
+Epoch 0039 | Time 0.081 (0.060) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 24.8541
+Epoch 0040 | Time 0.081 (0.060) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 14.2292
+Epoch 0041 | Time 0.080 (0.060) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 35.8495
+Epoch 0042 | Time 0.081 (0.060) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 48.5853
+Epoch 0043 | Time 0.095 (0.060) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 32.8219
+Epoch 0044 | Time 0.085 (0.061) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 13.8919
+Epoch 0045 | Time 0.081 (0.061) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 19.0081
+Epoch 0046 | Time 0.081 (0.061) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 33.9727
+Epoch 0047 | Time 0.080 (0.061) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 31.9405
+Epoch 0048 | Time 0.083 (0.062) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 17.1696
+Epoch 0049 | Time 0.080 (0.062) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 13.3440
+Epoch 0050 | Time 0.081 (0.062) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 23.0616
+Epoch 0051 | Time 0.080 (0.062) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 27.0475
+Epoch 0052 | Time 0.079 (0.062) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 18.5954
+Epoch 0053 | Time 0.079 (0.062) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 12.3674
+Epoch 0054 | Time 0.083 (0.063) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 17.0442
+Epoch 0055 | Time 0.081 (0.063) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 22.0347
+Epoch 0056 | Time 0.080 (0.063) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 18.1088
+Epoch 0057 | Time 0.080 (0.063) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 12.5425
+Epoch 0058 | Time 0.082 (0.063) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 14.2072
+Epoch 0059 | Time 0.083 (0.064) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 18.3169
+Epoch 0060 | Time 0.080 (0.064) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 16.8019
+Epoch 0061 | Time 0.082 (0.064) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 12.6660
+Epoch 0062 | Time 0.081 (0.064) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 12.9742
+Epoch 0063 | Time 0.081 (0.064) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 15.9148
+Epoch 0064 | Time 0.078 (0.064) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 15.4290
+Epoch 0065 | Time 0.084 (0.065) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 12.5671
+Epoch 0066 | Time 0.095 (0.065) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 12.4424
+Epoch 0067 | Time 0.082 (0.065) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 14.4453
+Epoch 0068 | Time 0.080 (0.065) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 14.2883
+Epoch 0069 | Time 0.092 (0.065) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 12.3480
+Epoch 0070 | Time 0.085 (0.066) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 12.1971
+Epoch 0071 | Time 0.084 (0.066) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 13.5471
+Epoch 0072 | Time 0.083 (0.066) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 13.4258
+Epoch 0073 | Time 0.082 (0.066) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 12.1133
+Epoch 0074 | Time 0.092 (0.066) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 12.0707
+Epoch 0075 | Time 0.085 (0.067) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 12.9756
+Epoch 0076 | Time 0.083 (0.067) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 12.7977
+Epoch 0077 | Time 0.077 (0.067) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 11.9191
+Epoch 0078 | Time 0.088 (0.067) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 11.9972
+Epoch 0079 | Time 0.083 (0.067) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 12.5854
+Epoch 0080 | Time 0.081 (0.067) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 12.3473
+Epoch 0081 | Time 0.086 (0.068) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 11.7836
+Epoch 0082 | Time 0.079 (0.068) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 11.9466
+Epoch 0083 | Time 0.079 (0.068) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 12.2963
+Epoch 0084 | Time 0.079 (0.068) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 12.0296
+Epoch 0085 | Time 0.078 (0.068) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 11.7040
+Epoch 0086 | Time 0.090 (0.068) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 11.9010
+Epoch 0087 | Time 0.081 (0.068) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 12.0673
+Epoch 0088 | Time 0.083 (0.069) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 11.8138
+Epoch 0089 | Time 0.085 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 11.6663
+Epoch 0090 | Time 0.080 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 11.8484
+Epoch 0091 | Time 0.081 (0.069) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 11.8812
+Epoch 0092 | Time 0.076 (0.069) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 11.6778
+Epoch 0093 | Time 0.079 (0.069) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 11.6521
+Epoch 0094 | Time 0.078 (0.069) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 11.7832
+Epoch 0095 | Time 0.080 (0.069) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 11.7338
+Epoch 0096 | Time 0.078 (0.069) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 11.6025
+Epoch 0097 | Time 0.083 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 11.6428
+Epoch 0098 | Time 0.082 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 11.7072
+Epoch 0099 | Time 0.086 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 11.6261
+Epoch 0100 | Time 0.086 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 11.5679
+Epoch 0101 | Time 0.084 (0.070) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 11.6242
+Epoch 0102 | Time 0.085 (0.070) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 11.6291
+Epoch 0103 | Time 0.085 (0.070) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 11.5571
+Epoch 0104 | Time 0.082 (0.071) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 11.5529
+Epoch 0105 | Time 0.078 (0.071) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 11.5910
+Epoch 0106 | Time 0.080 (0.071) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 11.5605
+Epoch 0107 | Time 0.079 (0.071) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 11.5197
+Epoch 0108 | Time 0.083 (0.071) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 11.5396
+Epoch 0109 | Time 0.078 (0.071) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 11.5472
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=8, hyper_hidden=8, lr=0.001, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=8, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=8, out_features=8, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=8, out_features=8, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=8, out_features=8, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=8, out_features=8, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=8, out_features=8, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=8, out_features=8, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=8, out_features=8, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=8, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 2172
+Epoch 0000 | Time 0.058 (0.058) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 3021.5576
+Epoch 0001 | Time 0.084 (0.058) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 2919.4507
+Epoch 0002 | Time 0.079 (0.059) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 2802.1230
+Epoch 0003 | Time 0.082 (0.059) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 2676.7778
+Epoch 0004 | Time 0.084 (0.059) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 2566.2402
+Epoch 0005 | Time 0.081 (0.059) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 2471.7783
+Epoch 0006 | Time 0.080 (0.059) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 2384.4229
+Epoch 0007 | Time 0.081 (0.060) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 2299.3967
+Epoch 0008 | Time 0.083 (0.060) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 2215.6626
+Epoch 0009 | Time 0.082 (0.060) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 2134.5479
+Epoch 0010 | Time 0.086 (0.060) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 2057.5986
+Epoch 0011 | Time 0.087 (0.061) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 1984.6777
+Epoch 0012 | Time 0.079 (0.061) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 1914.7334
+Epoch 0013 | Time 0.083 (0.061) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 1846.9818
+Epoch 0014 | Time 0.078 (0.061) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 1781.0341
+Epoch 0015 | Time 0.083 (0.061) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 1716.7335
+Epoch 0016 | Time 0.088 (0.062) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 1654.0062
+Epoch 0017 | Time 0.083 (0.062) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 1592.8229
+Epoch 0018 | Time 0.083 (0.062) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 1533.1687
+Epoch 0019 | Time 0.078 (0.062) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 1475.0297
+Epoch 0020 | Time 0.077 (0.062) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 1418.4001
+Epoch 0021 | Time 0.084 (0.063) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 1363.2682
+Epoch 0022 | Time 0.088 (0.063) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 1309.6262
+Epoch 0023 | Time 0.083 (0.063) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 1257.4640
+Epoch 0024 | Time 0.082 (0.063) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 1206.7744
+Epoch 0025 | Time 0.085 (0.063) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 1157.5447
+Epoch 0026 | Time 0.083 (0.064) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 1109.7592
+Epoch 0027 | Time 0.082 (0.064) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 1063.4039
+Epoch 0028 | Time 0.078 (0.064) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 1018.4628
+Epoch 0029 | Time 0.085 (0.064) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 974.9205
+Epoch 0030 | Time 0.081 (0.064) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 932.7592
+Epoch 0031 | Time 0.082 (0.065) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 891.9597
+Epoch 0032 | Time 0.083 (0.065) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 852.5034
+Epoch 0033 | Time 0.082 (0.065) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 814.3697
+Epoch 0034 | Time 0.080 (0.065) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 777.5361
+Epoch 0035 | Time 0.084 (0.065) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 741.9815
+Epoch 0036 | Time 0.082 (0.065) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 707.6832
+Epoch 0037 | Time 0.081 (0.066) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 674.6177
+Epoch 0038 | Time 0.081 (0.066) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 642.7603
+Epoch 0039 | Time 0.080 (0.066) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 612.0876
+Epoch 0040 | Time 0.080 (0.066) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 582.5740
+Epoch 0041 | Time 0.080 (0.066) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 554.1938
+Epoch 0042 | Time 0.081 (0.066) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 526.9218
+Epoch 0043 | Time 0.083 (0.066) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 500.7305
+Epoch 0044 | Time 0.081 (0.067) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 475.5947
+Epoch 0045 | Time 0.082 (0.067) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 451.4875
+Epoch 0046 | Time 0.082 (0.067) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 428.3823
+Epoch 0047 | Time 0.085 (0.067) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 406.2518
+Epoch 0048 | Time 0.080 (0.067) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 385.0700
+Epoch 0049 | Time 0.082 (0.067) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 364.8088
+Epoch 0050 | Time 0.087 (0.068) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 345.4421
+Epoch 0051 | Time 0.080 (0.068) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 326.9430
+Epoch 0052 | Time 0.078 (0.068) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 309.2847
+Epoch 0053 | Time 0.082 (0.068) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 292.4409
+Epoch 0054 | Time 0.079 (0.068) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 276.3852
+Epoch 0055 | Time 0.084 (0.068) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 261.0914
+Epoch 0056 | Time 0.080 (0.068) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 246.5341
+Epoch 0057 | Time 0.079 (0.068) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 232.6872
+Epoch 0058 | Time 0.083 (0.069) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 219.5259
+Epoch 0059 | Time 0.082 (0.069) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 207.0253
+Epoch 0060 | Time 0.084 (0.069) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 195.1609
+Epoch 0061 | Time 0.079 (0.069) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 183.9088
+Epoch 0062 | Time 0.085 (0.069) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 173.2452
+Epoch 0063 | Time 0.085 (0.069) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 163.1469
+Epoch 0064 | Time 0.081 (0.069) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 153.5914
+Epoch 0065 | Time 0.086 (0.070) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 144.5563
+Epoch 0066 | Time 0.083 (0.070) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 136.0200
+Epoch 0067 | Time 0.080 (0.070) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 127.9610
+Epoch 0068 | Time 0.084 (0.070) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 120.3588
+Epoch 0069 | Time 0.082 (0.070) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 113.1931
+Epoch 0070 | Time 0.083 (0.070) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 106.4443
+Epoch 0071 | Time 0.081 (0.070) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 100.0932
+Epoch 0072 | Time 0.085 (0.070) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 94.1213
+Epoch 0073 | Time 0.085 (0.071) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 88.5105
+Epoch 0074 | Time 0.081 (0.071) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 83.2437
+Epoch 0075 | Time 0.081 (0.071) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 78.3035
+Epoch 0076 | Time 0.080 (0.071) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 73.6739
+Epoch 0077 | Time 0.084 (0.071) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 69.3389
+Epoch 0078 | Time 0.082 (0.071) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 65.2835
+Epoch 0079 | Time 0.082 (0.071) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 61.4927
+Epoch 0080 | Time 0.081 (0.071) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 57.9525
+Epoch 0081 | Time 0.087 (0.071) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 54.6494
+Epoch 0082 | Time 0.081 (0.072) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 51.5701
+Epoch 0083 | Time 0.081 (0.072) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 48.7022
+Epoch 0084 | Time 0.081 (0.072) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 46.0336
+Epoch 0085 | Time 0.083 (0.072) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 43.5529
+Epoch 0086 | Time 0.082 (0.072) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 41.2488
+Epoch 0087 | Time 0.082 (0.072) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 39.1111
+Epoch 0088 | Time 0.085 (0.072) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 37.1295
+Epoch 0089 | Time 0.081 (0.072) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 35.2944
+Epoch 0090 | Time 0.081 (0.072) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 33.5968
+Epoch 0091 | Time 0.082 (0.072) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 32.0278
+Epoch 0092 | Time 0.082 (0.073) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 30.5793
+Epoch 0093 | Time 0.081 (0.073) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 29.2433
+Epoch 0094 | Time 0.080 (0.073) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 28.0125
+Epoch 0095 | Time 0.083 (0.073) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 26.8796
+Epoch 0096 | Time 0.083 (0.073) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 25.8382
+Epoch 0097 | Time 0.083 (0.073) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 24.8818
+Epoch 0098 | Time 0.087 (0.073) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 24.0044
+Epoch 0099 | Time 0.083 (0.073) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 23.2006
+Epoch 0100 | Time 0.084 (0.073) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 22.4649
+Epoch 0101 | Time 0.079 (0.073) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 21.7923
+Epoch 0102 | Time 0.081 (0.074) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 21.1782
+Epoch 0103 | Time 0.081 (0.074) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 20.6181
+Epoch 0104 | Time 0.081 (0.074) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 20.1079
+Epoch 0105 | Time 0.085 (0.074) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 19.6438
+Epoch 0106 | Time 0.084 (0.074) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 19.2222
+Epoch 0107 | Time 0.082 (0.074) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 18.8395
+Epoch 0108 | Time 0.085 (0.074) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 18.4928
+Epoch 0109 | Time 0.087 (0.074) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 18.1790
+Epoch 0110 | Time 0.083 (0.074) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 17.8953
+Epoch 0111 | Time 0.078 (0.074) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 17.6394
+Epoch 0112 | Time 0.080 (0.074) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 17.4087
+Epoch 0113 | Time 0.082 (0.074) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 17.2010
+Epoch 0114 | Time 0.083 (0.075) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 17.0144
+Epoch 0115 | Time 0.080 (0.075) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 16.8470
+Epoch 0116 | Time 0.080 (0.075) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 16.6969
+Epoch 0117 | Time 0.077 (0.075) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 16.5627
+Epoch 0118 | Time 0.080 (0.075) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 16.4428
+Epoch 0119 | Time 0.082 (0.075) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 16.3359
+Epoch 0120 | Time 0.085 (0.075) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 16.2407
+Epoch 0121 | Time 0.080 (0.075) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 16.1560
+Epoch 0122 | Time 0.081 (0.075) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 16.0808
+Epoch 0123 | Time 0.080 (0.075) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 16.0142
+Epoch 0124 | Time 0.077 (0.075) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 15.9553
+Epoch 0125 | Time 0.081 (0.075) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 15.9032
+Epoch 0126 | Time 0.080 (0.075) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 15.8573
+Epoch 0127 | Time 0.080 (0.075) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 15.8168
+Epoch 0128 | Time 0.083 (0.075) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 15.7812
+Epoch 0129 | Time 0.085 (0.075) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 15.7500
+Epoch 0130 | Time 0.080 (0.075) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 15.7226
+Epoch 0131 | Time 0.086 (0.076) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 15.6985
+Epoch 0132 | Time 0.077 (0.076) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 15.6775
+Epoch 0133 | Time 0.080 (0.076) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 15.6590
+Epoch 0134 | Time 0.083 (0.076) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 15.6429
+Epoch 0135 | Time 0.081 (0.076) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 15.6288
+Epoch 0136 | Time 0.082 (0.076) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 15.6165
+Epoch 0137 | Time 0.081 (0.076) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 15.6056
+Epoch 0138 | Time 0.083 (0.076) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 15.5961
+Epoch 0139 | Time 0.082 (0.076) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 15.5877
+Epoch 0140 | Time 0.080 (0.076) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 15.5803
+Epoch 0141 | Time 0.083 (0.076) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 15.5737
+Epoch 0142 | Time 0.081 (0.076) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 15.5678
+Epoch 0143 | Time 0.079 (0.076) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 15.5626
+Epoch 0144 | Time 0.080 (0.076) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 15.5578
+Epoch 0145 | Time 0.081 (0.076) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 15.5534
+Epoch 0146 | Time 0.081 (0.076) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 15.5494
+Epoch 0147 | Time 0.079 (0.076) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 15.5457
+Epoch 0148 | Time 0.085 (0.076) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 15.5422
+Epoch 0149 | Time 0.081 (0.076) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 15.5388
+Epoch 0150 | Time 0.082 (0.077) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 15.5357
+Epoch 0151 | Time 0.084 (0.077) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 15.5326
+Epoch 0152 | Time 0.082 (0.077) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 15.5296
+Epoch 0153 | Time 0.080 (0.077) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 15.5267
+Epoch 0154 | Time 0.077 (0.077) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 15.5238
+Epoch 0155 | Time 0.080 (0.077) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 15.5209
+Epoch 0156 | Time 0.082 (0.077) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 15.5181
+Epoch 0157 | Time 0.082 (0.077) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 15.5152
+Epoch 0158 | Time 0.080 (0.077) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 15.5123
+Epoch 0159 | Time 0.080 (0.077) | NFE-F 25.2 | NFE-B 0.0 | Train Loss 15.5094
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=8, hyper_hidden=8, lr=0.1, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=8, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=8, out_features=8, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=8, out_features=8, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=8, out_features=8, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=8, out_features=8, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=8, out_features=8, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=8, out_features=8, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=8, out_features=8, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=8, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 2172
+Epoch 0000 | Time 0.052 (0.052) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 2655.2300
+Epoch 0001 | Time 0.081 (0.052) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 839.8631
+Epoch 0002 | Time 0.081 (0.052) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 129.0510
+Epoch 0003 | Time 0.080 (0.053) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 1171.8223
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=256, hyper_hidden=8, lr=0.1, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=256, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=256, out_features=256, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=256, out_features=256, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=256, out_features=256, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=256, out_features=256, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=256, out_features=256, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=256, out_features=256, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=256, out_features=256, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=256, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 507844
+Epoch 0000 | Time 0.086 (0.086) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 731.0154
+Epoch 0001 | Time 0.113 (0.086) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 2016.0734
+Epoch 0002 | Time 0.114 (0.086) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 5237.2349
+Epoch 0003 | Time 0.109 (0.087) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 4531.1206
+Epoch 0004 | Time 0.110 (0.087) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 1989.8824
+Epoch 0005 | Time 0.108 (0.087) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 301.6658
+Epoch 0006 | Time 0.108 (0.087) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 493.9580
+Epoch 0007 | Time 0.113 (0.088) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 1748.2029
+Epoch 0008 | Time 0.118 (0.088) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 2529.7563
+Epoch 0009 | Time 0.113 (0.088) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 2174.6316
+Epoch 0010 | Time 0.113 (0.088) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 1150.1814
+Epoch 0011 | Time 0.123 (0.089) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 309.2536
+Epoch 0012 | Time 0.111 (0.089) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 182.4230
+Epoch 0013 | Time 0.116 (0.089) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 663.3964
+Epoch 0014 | Time 0.119 (0.090) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 1192.1359
+Epoch 0015 | Time 0.114 (0.090) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 1284.9496
+Epoch 0016 | Time 0.118 (0.090) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 906.1856
+Epoch 0017 | Time 0.114 (0.090) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 392.6099
+Epoch 0018 | Time 0.112 (0.091) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 122.2978
+Epoch 0019 | Time 0.111 (0.091) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 225.7960
+Epoch 0020 | Time 0.116 (0.091) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 522.7018
+Epoch 0021 | Time 0.119 (0.091) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 710.4362
+Epoch 0022 | Time 0.116 (0.092) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 629.4308
+Epoch 0023 | Time 0.113 (0.092) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 366.4654
+Epoch 0024 | Time 0.112 (0.092) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 140.8226
+Epoch 0025 | Time 0.113 (0.092) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 107.4657
+Epoch 0026 | Time 0.110 (0.092) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 241.3730
+Epoch 0027 | Time 0.108 (0.092) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 383.8287
+Epoch 0028 | Time 0.110 (0.093) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 396.1730
+Epoch 0029 | Time 0.110 (0.093) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 274.5717
+Epoch 0030 | Time 0.113 (0.093) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 131.1252
+Epoch 0031 | Time 0.115 (0.093) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 79.6387
+Epoch 0032 | Time 0.111 (0.093) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 137.2011
+Epoch 0033 | Time 0.115 (0.094) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 223.2363
+Epoch 0034 | Time 0.112 (0.094) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 245.6334
+Epoch 0035 | Time 0.116 (0.094) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 185.3743
+Epoch 0036 | Time 0.113 (0.094) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 102.1742
+Epoch 0037 | Time 0.110 (0.094) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 67.7542
+Epoch 0038 | Time 0.111 (0.095) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 98.0614
+Epoch 0039 | Time 0.111 (0.095) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 146.7148
+Epoch 0040 | Time 0.110 (0.095) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 158.0894
+Epoch 0041 | Time 0.109 (0.095) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 121.6764
+Epoch 0042 | Time 0.121 (0.095) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 75.0557
+Epoch 0043 | Time 0.113 (0.095) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 60.0309
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=256, hyper_hidden=8, lr=0.01, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=256, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=256, out_features=256, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=256, out_features=256, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=256, out_features=256, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=256, out_features=256, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=256, out_features=256, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=256, out_features=256, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=256, out_features=256, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=256, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 507844
+Epoch 0000 | Time 0.078 (0.078) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 26152.4043
+Epoch 0001 | Time 0.110 (0.078) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 23588.1562
+Epoch 0002 | Time 0.110 (0.078) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 21162.1816
+Epoch 0003 | Time 0.108 (0.078) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 18876.9902
+Epoch 0004 | Time 0.111 (0.079) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 16734.2168
+Epoch 0005 | Time 0.113 (0.079) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 14734.7988
+Epoch 0006 | Time 0.112 (0.079) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 12879.0420
+Epoch 0007 | Time 0.110 (0.080) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 11166.5918
+Epoch 0008 | Time 0.112 (0.080) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 9596.4043
+Epoch 0009 | Time 0.112 (0.080) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 8166.7227
+Epoch 0010 | Time 0.117 (0.081) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 6875.0317
+Epoch 0011 | Time 0.129 (0.081) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 5718.0449
+Epoch 0012 | Time 0.118 (0.082) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 4691.6826
+Epoch 0013 | Time 0.109 (0.082) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 3791.0713
+Epoch 0014 | Time 0.111 (0.082) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 3010.5569
+Epoch 0015 | Time 0.115 (0.083) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 2343.7344
+Epoch 0016 | Time 0.114 (0.083) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 1783.4954
+Epoch 0017 | Time 0.107 (0.083) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 1322.0996
+Epoch 0018 | Time 0.111 (0.083) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 951.2646
+Epoch 0019 | Time 0.109 (0.084) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 662.2769
+Epoch 0020 | Time 0.114 (0.084) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 446.1218
+Epoch 0021 | Time 0.112 (0.084) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 293.6271
+Epoch 0022 | Time 0.110 (0.084) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 195.6184
+Epoch 0023 | Time 0.111 (0.085) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 143.0789
+Epoch 0024 | Time 0.114 (0.085) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 127.3078
+Epoch 0025 | Time 0.115 (0.085) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 140.0706
+Epoch 0026 | Time 0.116 (0.086) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 173.7353
+Epoch 0027 | Time 0.114 (0.086) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 221.3870
+Epoch 0028 | Time 0.110 (0.086) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 276.9182
+Epoch 0029 | Time 0.109 (0.086) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 335.0908
+Epoch 0030 | Time 0.110 (0.087) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 391.5665
+Epoch 0031 | Time 0.109 (0.087) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 442.9104
+Epoch 0032 | Time 0.112 (0.087) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 486.5629
+Epoch 0033 | Time 0.111 (0.087) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 520.7906
+Epoch 0034 | Time 0.113 (0.088) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 544.6128
+Epoch 0035 | Time 0.110 (0.088) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 557.7159
+Epoch 0036 | Time 0.110 (0.088) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 560.3521
+Epoch 0037 | Time 0.115 (0.088) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 553.2372
+Epoch 0038 | Time 0.113 (0.089) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 537.4434
+Epoch 0039 | Time 0.114 (0.089) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 514.2948
+Epoch 0040 | Time 0.109 (0.089) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 485.2726
+Epoch 0041 | Time 0.116 (0.089) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 451.9241
+Epoch 0042 | Time 0.112 (0.089) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 415.7862
+Epoch 0043 | Time 0.116 (0.090) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 378.3199
+Epoch 0044 | Time 0.117 (0.090) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 340.8577
+Epoch 0045 | Time 0.113 (0.090) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 304.5641
+Epoch 0046 | Time 0.111 (0.090) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 270.4094
+Epoch 0047 | Time 0.112 (0.091) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 239.1541
+Epoch 0048 | Time 0.115 (0.091) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 211.3461
+Epoch 0049 | Time 0.114 (0.091) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 187.3263
+Epoch 0050 | Time 0.108 (0.091) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 167.2424
+Epoch 0051 | Time 0.117 (0.092) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 151.0690
+Epoch 0052 | Time 0.116 (0.092) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 138.6332
+Epoch 0053 | Time 0.113 (0.092) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 129.6422
+Epoch 0054 | Time 0.113 (0.092) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 123.7126
+Epoch 0055 | Time 0.112 (0.092) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 120.4004
+Epoch 0056 | Time 0.107 (0.093) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 119.2282
+Epoch 0057 | Time 0.114 (0.093) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 119.7119
+Epoch 0058 | Time 0.118 (0.093) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 121.3819
+Epoch 0059 | Time 0.111 (0.093) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 123.8026
+Epoch 0060 | Time 0.109 (0.093) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 126.5862
+Epoch 0061 | Time 0.112 (0.094) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 129.4027
+Epoch 0062 | Time 0.112 (0.094) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 131.9863
+Epoch 0063 | Time 0.112 (0.094) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 134.1366
+Epoch 0064 | Time 0.111 (0.094) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 135.7179
+Epoch 0065 | Time 0.118 (0.094) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 136.6545
+Epoch 0066 | Time 0.111 (0.095) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 136.9240
+Epoch 0067 | Time 0.109 (0.095) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 136.5495
+Epoch 0068 | Time 0.129 (0.095) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 135.5902
+Epoch 0069 | Time 0.124 (0.095) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 134.1317
+Epoch 0070 | Time 0.110 (0.095) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 132.2771
+Epoch 0071 | Time 0.118 (0.096) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 130.1377
+Epoch 0072 | Time 0.116 (0.096) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 127.8259
+Epoch 0073 | Time 0.110 (0.096) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 125.4479
+Epoch 0074 | Time 0.111 (0.096) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 123.0990
+Epoch 0075 | Time 0.111 (0.096) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 120.8596
+Epoch 0076 | Time 0.109 (0.096) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 118.7933
+Epoch 0077 | Time 0.116 (0.097) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 116.9454
+Epoch 0078 | Time 0.111 (0.097) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 115.3436
+Epoch 0079 | Time 0.113 (0.097) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 113.9986
+Epoch 0080 | Time 0.117 (0.097) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 112.9065
+Epoch 0081 | Time 0.114 (0.097) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 112.0512
+Epoch 0082 | Time 0.109 (0.097) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 111.4070
+Epoch 0083 | Time 0.110 (0.098) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 110.9418
+Epoch 0084 | Time 0.113 (0.098) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 110.6197
+Epoch 0085 | Time 0.110 (0.098) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 110.4035
+Epoch 0086 | Time 0.115 (0.098) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 110.2573
+Epoch 0087 | Time 0.110 (0.098) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 110.1482
+Epoch 0088 | Time 0.112 (0.098) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 110.0476
+Epoch 0089 | Time 0.112 (0.098) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 109.9322
+Epoch 0090 | Time 0.115 (0.099) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 109.7841
+Epoch 0091 | Time 0.112 (0.099) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 109.5916
+Epoch 0092 | Time 0.110 (0.099) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 109.3483
+Epoch 0093 | Time 0.114 (0.099) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 109.0524
+Epoch 0094 | Time 0.111 (0.099) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 108.7065
+Epoch 0095 | Time 0.117 (0.099) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 108.3162
+Epoch 0096 | Time 0.113 (0.099) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 107.8894
+Epoch 0097 | Time 0.115 (0.100) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 107.4355
+Epoch 0098 | Time 0.113 (0.100) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 106.9641
+Epoch 0099 | Time 0.111 (0.100) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 106.4846
+Epoch 0100 | Time 0.109 (0.100) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 106.0056
+Epoch 0101 | Time 0.113 (0.100) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 105.5345
+Epoch 0102 | Time 0.111 (0.100) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 105.0769
+Epoch 0103 | Time 0.114 (0.100) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 104.6369
+Epoch 0104 | Time 0.115 (0.100) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 104.2168
+Epoch 0105 | Time 0.119 (0.101) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 103.8174
+Epoch 0106 | Time 0.109 (0.101) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 103.4381
+Epoch 0107 | Time 0.112 (0.101) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 103.0771
+Epoch 0108 | Time 0.120 (0.101) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 102.7319
+Epoch 0109 | Time 0.112 (0.101) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 102.3995
+Epoch 0110 | Time 0.110 (0.101) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 102.0765
+Epoch 0111 | Time 0.111 (0.101) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 101.7598
+Epoch 0112 | Time 0.111 (0.101) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 101.4462
+Epoch 0113 | Time 0.112 (0.102) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 101.1331
+Epoch 0114 | Time 0.110 (0.102) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 100.8185
+Epoch 0115 | Time 0.109 (0.102) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 100.5007
+Epoch 0116 | Time 0.110 (0.102) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 100.1788
+Epoch 0117 | Time 0.112 (0.102) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 99.8523
+Epoch 0118 | Time 0.108 (0.102) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 99.5211
+Epoch 0119 | Time 0.113 (0.102) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 99.1857
+Epoch 0120 | Time 0.112 (0.102) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 98.8467
+Epoch 0121 | Time 0.115 (0.102) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 98.5050
+Epoch 0122 | Time 0.109 (0.102) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 98.1615
+Epoch 0123 | Time 0.118 (0.102) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 97.8173
+Epoch 0124 | Time 0.113 (0.103) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 97.4731
+Epoch 0125 | Time 0.114 (0.103) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 97.1298
+Epoch 0126 | Time 0.110 (0.103) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 96.7878
+Epoch 0127 | Time 0.113 (0.103) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 96.4478
+Epoch 0128 | Time 0.111 (0.103) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 96.1098
+Epoch 0129 | Time 0.112 (0.103) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 95.7741
+Epoch 0130 | Time 0.116 (0.103) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 95.4405
+Epoch 0131 | Time 0.107 (0.103) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 95.1089
+Epoch 0132 | Time 0.111 (0.103) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 94.7790
+Epoch 0133 | Time 0.114 (0.103) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 94.4505
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=8, hyper_hidden=8, lr=0.01, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=8, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=8, out_features=8, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=8, out_features=8, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=8, out_features=8, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=8, out_features=8, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=8, out_features=8, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=8, out_features=8, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=8, out_features=8, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=8, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 2172
+Epoch 0000 | Time 0.051 (0.051) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 1184.3640
+Epoch 0001 | Time 0.079 (0.051) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 727.2823
+Epoch 0002 | Time 0.079 (0.052) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 403.2333
+Epoch 0003 | Time 0.082 (0.052) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 205.7345
+Epoch 0004 | Time 0.080 (0.052) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 120.3673
+Epoch 0005 | Time 0.080 (0.052) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 123.3114
+Epoch 0006 | Time 0.080 (0.053) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 182.5055
+Epoch 0007 | Time 0.079 (0.053) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 262.8900
+Epoch 0008 | Time 0.082 (0.053) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 334.2912
+Epoch 0009 | Time 0.079 (0.053) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 377.5869
+Epoch 0010 | Time 0.081 (0.054) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 386.1079
+Epoch 0011 | Time 0.082 (0.054) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 363.0370
+Epoch 0012 | Time 0.083 (0.054) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 317.3429
+Epoch 0013 | Time 0.079 (0.055) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 260.3018
+Epoch 0014 | Time 0.081 (0.055) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 203.4306
+Epoch 0015 | Time 0.080 (0.055) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 155.3506
+Epoch 0016 | Time 0.083 (0.055) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 121.6054
+Epoch 0017 | Time 0.081 (0.056) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 104.5790
+Epoch 0018 | Time 0.080 (0.056) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 103.1159
+Epoch 0019 | Time 0.079 (0.056) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 113.4392
+Epoch 0020 | Time 0.081 (0.056) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 130.0931
+Epoch 0021 | Time 0.082 (0.057) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 147.2605
+Epoch 0022 | Time 0.085 (0.057) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 160.0721
+Epoch 0023 | Time 0.083 (0.057) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 165.4980
+Epoch 0024 | Time 0.083 (0.057) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 162.6834
+Epoch 0025 | Time 0.079 (0.058) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 152.7443
+Epoch 0026 | Time 0.083 (0.058) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 138.1801
+Epoch 0027 | Time 0.084 (0.058) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 122.1068
+Epoch 0028 | Time 0.084 (0.058) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 107.5015
+Epoch 0029 | Time 0.080 (0.059) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 96.5960
+Epoch 0030 | Time 0.081 (0.059) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 90.5101
+Epoch 0031 | Time 0.080 (0.059) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 89.1650
+Epoch 0032 | Time 0.081 (0.059) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 91.4650
+Epoch 0033 | Time 0.080 (0.059) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 95.6848
+Epoch 0034 | Time 0.083 (0.060) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 99.9561
+Epoch 0035 | Time 0.076 (0.060) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 102.7251
+Epoch 0036 | Time 0.081 (0.060) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 103.0729
+Epoch 0037 | Time 0.080 (0.060) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 100.8368
+Epoch 0038 | Time 0.080 (0.060) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 96.5297
+Epoch 0039 | Time 0.081 (0.061) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 91.1079
+Epoch 0040 | Time 0.078 (0.061) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 85.6675
+Epoch 0041 | Time 0.078 (0.061) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 81.1518
+Epoch 0042 | Time 0.079 (0.061) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 78.1384
+Epoch 0043 | Time 0.081 (0.061) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 76.7481
+Epoch 0044 | Time 0.082 (0.062) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 76.6810
+Epoch 0045 | Time 0.085 (0.062) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 77.3557
+Epoch 0046 | Time 0.081 (0.062) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 78.1029
+Epoch 0047 | Time 0.082 (0.062) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 78.3547
+Epoch 0048 | Time 0.078 (0.062) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 77.7797
+Epoch 0049 | Time 0.080 (0.063) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 76.3349
+Epoch 0050 | Time 0.080 (0.063) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 74.2314
+Epoch 0051 | Time 0.080 (0.063) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 71.8362
+Epoch 0052 | Time 0.080 (0.063) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 69.5456
+Epoch 0053 | Time 0.080 (0.063) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 67.6701
+Epoch 0054 | Time 0.083 (0.063) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 66.3599
+Epoch 0055 | Time 0.078 (0.064) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 65.5875
+Epoch 0056 | Time 0.080 (0.064) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 65.1824
+Epoch 0057 | Time 0.081 (0.064) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 64.9032
+Epoch 0058 | Time 0.080 (0.064) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 64.5181
+Epoch 0059 | Time 0.080 (0.064) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 63.8717
+Epoch 0060 | Time 0.079 (0.064) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 62.9186
+Epoch 0061 | Time 0.079 (0.065) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 61.7186
+Epoch 0062 | Time 0.078 (0.065) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 60.4020
+Epoch 0063 | Time 0.078 (0.065) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 59.1183
+Epoch 0064 | Time 0.082 (0.065) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 57.9874
+Epoch 0065 | Time 0.081 (0.065) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 57.0670
+Epoch 0066 | Time 0.082 (0.065) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 56.3448
+Epoch 0067 | Time 0.082 (0.065) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 55.7535
+Epoch 0068 | Time 0.079 (0.066) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 55.2007
+Epoch 0069 | Time 0.085 (0.066) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 54.6023
+Epoch 0070 | Time 0.080 (0.066) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 53.9079
+Epoch 0071 | Time 0.080 (0.066) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 53.1112
+Epoch 0072 | Time 0.081 (0.066) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 52.2449
+Epoch 0073 | Time 0.079 (0.066) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 51.3636
+Epoch 0074 | Time 0.081 (0.067) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 50.5218
+Epoch 0075 | Time 0.080 (0.067) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 49.7561
+Epoch 0076 | Time 0.082 (0.067) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 49.0760
+Epoch 0077 | Time 0.078 (0.067) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 48.4646
+Epoch 0078 | Time 0.082 (0.067) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 47.8892
+Epoch 0079 | Time 0.079 (0.067) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 47.3146
+Epoch 0080 | Time 0.079 (0.067) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 46.7157
+Epoch 0081 | Time 0.080 (0.067) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 46.0842
+Epoch 0082 | Time 0.082 (0.068) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 45.4288
+Epoch 0083 | Time 0.077 (0.068) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 44.7690
+Epoch 0084 | Time 0.080 (0.068) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 44.1268
+Epoch 0085 | Time 0.078 (0.068) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 43.5179
+Epoch 0086 | Time 0.079 (0.068) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 42.9479
+Epoch 0087 | Time 0.083 (0.068) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 42.4110
+Epoch 0088 | Time 0.083 (0.068) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 41.8949
+Epoch 0089 | Time 0.079 (0.068) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 41.3856
+Epoch 0090 | Time 0.083 (0.069) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 40.8730
+Epoch 0091 | Time 0.082 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 40.3538
+Epoch 0092 | Time 0.081 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 39.8316
+Epoch 0093 | Time 0.079 (0.069) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 39.3141
+Epoch 0094 | Time 0.082 (0.069) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 38.8100
+Epoch 0095 | Time 0.084 (0.069) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 38.3248
+Epoch 0096 | Time 0.082 (0.069) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 37.8600
+Epoch 0097 | Time 0.080 (0.069) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 37.4124
+Epoch 0098 | Time 0.080 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 36.9769
+Epoch 0099 | Time 0.078 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 36.5479
+Epoch 0100 | Time 0.080 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 36.1221
+Epoch 0101 | Time 0.083 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 35.6989
+Epoch 0102 | Time 0.082 (0.070) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 35.2803
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=16, hyper_hidden=8, lr=0.01, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=16, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=16, out_features=16, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=16, out_features=16, bias=True)
+        (5): Tanh()
+        (6): Linear(in_features=16, out_features=16, bias=True)
+        (7): Tanh()
+        (8): Linear(in_features=16, out_features=16, bias=True)
+        (9): Tanh()
+        (10): Linear(in_features=16, out_features=16, bias=True)
+        (11): Tanh()
+        (12): Linear(in_features=16, out_features=16, bias=True)
+        (13): Tanh()
+        (14): Linear(in_features=16, out_features=16, bias=True)
+        (15): Tanh()
+        (16): Linear(in_features=16, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 5044
+Epoch 0000 | Time 0.054 (0.054) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 272.0935
+Epoch 0001 | Time 0.082 (0.055) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 107.3123
+Epoch 0002 | Time 0.082 (0.055) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 59.3279
+Epoch 0003 | Time 0.081 (0.055) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 93.8254
+Epoch 0004 | Time 0.082 (0.055) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 153.3035
+Epoch 0005 | Time 0.078 (0.056) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 192.4687
+Epoch 0006 | Time 0.082 (0.056) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 194.6104
+Epoch 0007 | Time 0.077 (0.056) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 166.8757
+Epoch 0008 | Time 0.085 (0.056) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 125.7683
+Epoch 0009 | Time 0.082 (0.057) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 87.3394
+Epoch 0010 | Time 0.086 (0.057) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 62.6671
+Epoch 0011 | Time 0.090 (0.057) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 55.9704
+Epoch 0012 | Time 0.082 (0.058) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 64.5377
+Epoch 0013 | Time 0.083 (0.058) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 80.6607
+Epoch 0014 | Time 0.079 (0.058) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 95.2968
+Epoch 0015 | Time 0.080 (0.058) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 101.8747
+Epoch 0016 | Time 0.083 (0.059) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 98.3540
+Epoch 0017 | Time 0.082 (0.059) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 86.9560
+Epoch 0018 | Time 0.080 (0.059) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 72.3826
+Epoch 0019 | Time 0.081 (0.059) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 59.6514
+Epoch 0020 | Time 0.081 (0.059) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 52.3055
+Epoch 0021 | Time 0.078 (0.060) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 51.4024
+Epoch 0022 | Time 0.087 (0.060) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 55.4744
+Epoch 0023 | Time 0.081 (0.060) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 61.4221
+Epoch 0024 | Time 0.082 (0.060) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 65.9548
+Epoch 0025 | Time 0.076 (0.060) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 66.9279
+Epoch 0026 | Time 0.083 (0.061) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 64.0079
+Epoch 0027 | Time 0.080 (0.061) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 58.4937
+Epoch 0028 | Time 0.081 (0.061) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 52.5260
+Epoch 0029 | Time 0.083 (0.061) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 48.1057
+Epoch 0030 | Time 0.085 (0.061) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 46.3188
+Epoch 0031 | Time 0.080 (0.062) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 47.0276
+Epoch 0032 | Time 0.079 (0.062) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 49.0986
+Epoch 0033 | Time 0.079 (0.062) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 51.0213
+Epoch 0034 | Time 0.081 (0.062) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 51.6100
+Epoch 0035 | Time 0.082 (0.062) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 50.4661
+Epoch 0036 | Time 0.086 (0.063) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 48.0276
+Epoch 0037 | Time 0.078 (0.063) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 45.2448
+Epoch 0038 | Time 0.079 (0.063) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 43.0823
+Epoch 0039 | Time 0.083 (0.063) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 42.0880
+Epoch 0040 | Time 0.085 (0.063) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 42.2079
+Epoch 0041 | Time 0.083 (0.064) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 42.8994
+Epoch 0042 | Time 0.081 (0.064) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 43.4536
+Epoch 0043 | Time 0.083 (0.064) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 43.3514
+Epoch 0044 | Time 0.082 (0.064) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 42.4787
+Epoch 0045 | Time 0.079 (0.064) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 41.1166
+Epoch 0046 | Time 0.086 (0.064) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 39.7448
+Epoch 0047 | Time 0.082 (0.065) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 38.7783
+Epoch 0048 | Time 0.083 (0.065) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 38.3750
+Epoch 0049 | Time 0.080 (0.065) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 38.3967
+Epoch 0050 | Time 0.080 (0.065) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 38.5236
+Epoch 0051 | Time 0.079 (0.065) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 38.4424
+Epoch 0052 | Time 0.082 (0.065) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 38.0043
+Epoch 0053 | Time 0.080 (0.066) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 37.2746
+Epoch 0054 | Time 0.082 (0.066) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 36.4650
+Epoch 0055 | Time 0.079 (0.066) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 35.7999
+Epoch 0056 | Time 0.079 (0.066) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 35.3965
+Epoch 0057 | Time 0.082 (0.066) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 35.2196
+Epoch 0058 | Time 0.086 (0.066) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 35.1245
+Epoch 0059 | Time 0.080 (0.067) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 34.9516
+Epoch 0060 | Time 0.082 (0.067) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 34.6154
+Epoch 0061 | Time 0.085 (0.067) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 34.1390
+Epoch 0062 | Time 0.080 (0.067) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 33.6238
+Epoch 0063 | Time 0.080 (0.067) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 33.1802
+Epoch 0064 | Time 0.082 (0.067) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 32.8644
+Epoch 0065 | Time 0.084 (0.067) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 32.6554
+Epoch 0066 | Time 0.081 (0.068) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 32.4793
+Epoch 0067 | Time 0.081 (0.068) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 32.2599
+Epoch 0068 | Time 0.081 (0.068) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 31.9627
+Epoch 0069 | Time 0.079 (0.068) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 31.6083
+Epoch 0070 | Time 0.083 (0.068) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 31.2507
+Epoch 0071 | Time 0.081 (0.068) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 30.9404
+Epoch 0072 | Time 0.084 (0.068) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 30.6947
+Epoch 0073 | Time 0.078 (0.068) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 30.4928
+Epoch 0074 | Time 0.083 (0.069) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 30.2945
+Epoch 0075 | Time 0.082 (0.069) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 30.0674
+Epoch 0076 | Time 0.079 (0.069) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 29.8056
+Epoch 0077 | Time 0.083 (0.069) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 29.5281
+Epoch 0078 | Time 0.082 (0.069) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 29.2637
+Epoch 0079 | Time 0.082 (0.069) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 29.0306
+Epoch 0080 | Time 0.077 (0.069) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 28.8274
+Epoch 0081 | Time 0.081 (0.069) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 28.6368
+Epoch 0082 | Time 0.078 (0.070) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 28.4392
+Epoch 0083 | Time 0.086 (0.070) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 28.2254
+Epoch 0084 | Time 0.082 (0.070) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 28.0007
+Epoch 0085 | Time 0.081 (0.070) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 27.7789
+Epoch 0086 | Time 0.080 (0.070) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 27.5718
+Epoch 0087 | Time 0.082 (0.070) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 27.3822
+Epoch 0088 | Time 0.079 (0.070) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 27.2028
+Epoch 0089 | Time 0.080 (0.070) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 27.0234
+Epoch 0090 | Time 0.080 (0.070) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 26.8376
+Epoch 0091 | Time 0.081 (0.071) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 26.6463
+Epoch 0092 | Time 0.078 (0.071) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 26.4561
+Epoch 0093 | Time 0.080 (0.071) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 26.2736
+Epoch 0094 | Time 0.080 (0.071) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 26.1010
+Epoch 0095 | Time 0.077 (0.071) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 25.9351
+Epoch 0096 | Time 0.085 (0.071) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 25.7707
+Epoch 0097 | Time 0.081 (0.071) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 25.6042
+Epoch 0098 | Time 0.080 (0.071) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 25.4356
+Epoch 0099 | Time 0.081 (0.071) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 25.2683
+Epoch 0100 | Time 0.085 (0.071) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 25.1057
+Epoch 0101 | Time 0.085 (0.072) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 24.9488
+Epoch 0102 | Time 0.080 (0.072) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 24.7962
+Epoch 0103 | Time 0.078 (0.072) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 24.6450
+Epoch 0104 | Time 0.080 (0.072) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 24.4934
+Epoch 0105 | Time 0.083 (0.072) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 24.3416
+Epoch 0106 | Time 0.084 (0.072) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 24.1913
+Epoch 0107 | Time 0.079 (0.072) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 24.0443
+Epoch 0108 | Time 0.083 (0.072) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 23.9009
+Epoch 0109 | Time 0.084 (0.072) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 23.7601
+Epoch 0110 | Time 0.083 (0.072) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 23.6205
+Epoch 0111 | Time 0.080 (0.073) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 23.4812
+Epoch 0112 | Time 0.083 (0.073) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 23.3427
+Epoch 0113 | Time 0.084 (0.073) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 23.2057
+Epoch 0114 | Time 0.079 (0.073) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 23.0711
+Epoch 0115 | Time 0.081 (0.073) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 22.9390
+Epoch 0116 | Time 0.081 (0.073) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 22.8085
+Epoch 0117 | Time 0.073 (0.073) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 22.6791
+Epoch 0118 | Time 0.080 (0.073) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 22.5504
+Epoch 0119 | Time 0.084 (0.073) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 22.4228
+Epoch 0120 | Time 0.086 (0.073) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 22.2967
+Epoch 0121 | Time 0.082 (0.073) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 22.1724
+Epoch 0122 | Time 0.081 (0.073) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 22.0498
+Epoch 0123 | Time 0.078 (0.073) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 21.9285
+Epoch 0124 | Time 0.083 (0.074) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 21.8082
+Epoch 0125 | Time 0.077 (0.074) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 21.6888
+Epoch 0126 | Time 0.082 (0.074) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 21.5705
+Epoch 0127 | Time 0.081 (0.074) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 21.4537
+Epoch 0128 | Time 0.082 (0.074) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 21.3382
+Epoch 0129 | Time 0.085 (0.074) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 21.2241
+Epoch 0130 | Time 0.082 (0.074) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 21.1110
+Epoch 0131 | Time 0.083 (0.074) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 20.9989
+Epoch 0132 | Time 0.084 (0.074) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 20.8878
+Epoch 0133 | Time 0.078 (0.074) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 20.7778
+Epoch 0134 | Time 0.080 (0.074) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 20.6691
+Epoch 0135 | Time 0.080 (0.074) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 20.5616
+Epoch 0136 | Time 0.081 (0.074) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 20.4551
+Epoch 0137 | Time 0.079 (0.074) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 20.3496
+Epoch 0138 | Time 0.083 (0.075) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 20.2451
+Epoch 0139 | Time 0.080 (0.075) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 20.1416
+Epoch 0140 | Time 0.087 (0.075) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 20.0391
+Epoch 0141 | Time 0.085 (0.075) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 19.9378
+Epoch 0142 | Time 0.084 (0.075) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 19.8375
+Epoch 0143 | Time 0.082 (0.075) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 19.7381
+Epoch 0144 | Time 0.080 (0.075) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 19.6397
+Epoch 0145 | Time 0.086 (0.075) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 19.5423
+Epoch 0146 | Time 0.084 (0.075) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 19.4458
+Epoch 0147 | Time 0.080 (0.075) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 19.3504
+Epoch 0148 | Time 0.085 (0.075) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 19.2560
+Epoch 0149 | Time 0.084 (0.075) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 19.1624
+Epoch 0150 | Time 0.082 (0.076) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 19.0698
+Epoch 0151 | Time 0.081 (0.076) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 18.9781
+Epoch 0152 | Time 0.082 (0.076) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 18.8874
+Epoch 0153 | Time 0.080 (0.076) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 18.7976
+Epoch 0154 | Time 0.080 (0.076) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 18.7087
+Epoch 0155 | Time 0.079 (0.076) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 18.6207
+Epoch 0156 | Time 0.083 (0.076) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 18.5336
+Epoch 0157 | Time 0.076 (0.076) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 18.4474
+Epoch 0158 | Time 0.083 (0.076) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 18.3621
+Epoch 0159 | Time 0.080 (0.076) | NFE-F 25.2 | NFE-B 0.0 | Train Loss 18.2777
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=16, hyper_hidden=2, lr=0.01, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=16, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=16, out_features=16, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=16, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 3412
+Epoch 0000 | Time 0.047 (0.047) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 39.4678
+Epoch 0001 | Time 0.079 (0.047) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 47.1884
+Epoch 0002 | Time 0.071 (0.047) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 35.1912
+Epoch 0003 | Time 0.074 (0.047) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 34.4672
+Epoch 0004 | Time 0.072 (0.048) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 39.2334
+Epoch 0005 | Time 0.072 (0.048) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 33.6470
+Epoch 0006 | Time 0.075 (0.048) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 30.4710
+Epoch 0007 | Time 0.075 (0.048) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 33.5817
+Epoch 0008 | Time 0.072 (0.049) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 33.4069
+Epoch 0009 | Time 0.073 (0.049) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 29.5242
+Epoch 0010 | Time 0.069 (0.049) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 28.4943
+Epoch 0011 | Time 0.072 (0.049) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 29.2873
+Epoch 0012 | Time 0.088 (0.050) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 27.8980
+Epoch 0013 | Time 0.076 (0.050) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 26.9021
+Epoch 0014 | Time 0.068 (0.050) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 25.9813
+Epoch 0015 | Time 0.079 (0.050) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 25.3770
+Epoch 0016 | Time 0.070 (0.051) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 25.0259
+Epoch 0017 | Time 0.081 (0.051) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 24.4300
+Epoch 0018 | Time 0.084 (0.051) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 23.9473
+Epoch 0019 | Time 0.072 (0.051) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 23.4395
+Epoch 0020 | Time 0.079 (0.052) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 22.9285
+Epoch 0021 | Time 0.075 (0.052) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 22.4484
+Epoch 0022 | Time 0.075 (0.052) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 21.9863
+Epoch 0023 | Time 0.077 (0.052) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 21.5161
+Epoch 0024 | Time 0.077 (0.053) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 21.0627
+Epoch 0025 | Time 0.078 (0.053) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 20.6105
+Epoch 0026 | Time 0.070 (0.053) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 20.1944
+Epoch 0027 | Time 0.074 (0.053) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 19.7708
+Epoch 0028 | Time 0.072 (0.054) | NFE-F 17.8 | NFE-B 0.0 | Train Loss 19.3642
+Epoch 0029 | Time 0.079 (0.054) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 18.9790
+Epoch 0030 | Time 0.072 (0.054) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 18.6009
+Epoch 0031 | Time 0.076 (0.054) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 18.2303
+Epoch 0032 | Time 0.075 (0.054) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 17.8792
+Epoch 0033 | Time 0.070 (0.055) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 17.5438
+Epoch 0034 | Time 0.074 (0.055) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 17.2150
+Epoch 0035 | Time 0.073 (0.055) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 16.8988
+Epoch 0036 | Time 0.075 (0.055) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 16.6006
+Epoch 0037 | Time 0.073 (0.055) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 16.3131
+Epoch 0038 | Time 0.070 (0.055) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 16.0342
+Epoch 0039 | Time 0.077 (0.056) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 15.7706
+Epoch 0040 | Time 0.075 (0.056) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 15.5204
+Epoch 0041 | Time 0.076 (0.056) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 15.2785
+Epoch 0042 | Time 0.074 (0.056) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 15.0480
+Epoch 0043 | Time 0.074 (0.056) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 14.8295
+Epoch 0044 | Time 0.071 (0.057) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 14.4688
+Epoch 0045 | Time 0.085 (0.057) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 14.2223
+Epoch 0046 | Time 0.084 (0.057) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 13.8953
+Epoch 0047 | Time 0.076 (0.057) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 14.1927
+Epoch 0048 | Time 0.085 (0.058) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 13.9576
+Epoch 0049 | Time 0.076 (0.058) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 13.5708
+Epoch 0050 | Time 0.076 (0.058) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 13.6396
+Epoch 0051 | Time 0.070 (0.058) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 13.4515
+Epoch 0052 | Time 0.075 (0.058) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 13.2983
+Epoch 0053 | Time 0.075 (0.058) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 13.2764
+Epoch 0054 | Time 0.075 (0.059) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 13.1749
+Epoch 0055 | Time 0.073 (0.059) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 12.9442
+Epoch 0056 | Time 0.093 (0.059) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 12.9023
+Epoch 0057 | Time 0.076 (0.059) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 12.8876
+Epoch 0058 | Time 0.077 (0.059) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 12.1900
+/home/tudockho/Documents/torchdiffeq/examples/odenet_boston.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from sklearn import datasets
+from sklearn import preprocessing
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval,
+                    default=False, choices=[True, False])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+
+parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+
+parser.add_argument('--hyper_dim', type=int, default=8)
+parser.add_argument('--hyper_hidden', type=int, default=8)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+        super(ODEfunc, self).__init__()
+        self.dim = dim
+        self.params_dim = self.dim**2 + self.dim
+        self.activation = activation
+
+        print('Number of outputs in hypernet:', self.params_dim)
+
+        layers = []
+        dims = [1] + [hypernet_dim] * \
+            hypernet_hidden_layers + [self.params_dim]
+
+        for i in range(1, len(dims)):
+            layers.append(nn.Linear(dims[i - 1], dims[i]))
+            if i < len(dims) - 1:
+                layers.append(self.activation())
+
+        self._hypernet = nn.Sequential(*layers)
+        self._hypernet.apply(weights_init)
+
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+
+        params = self._hypernet(t.view(1, 1)).view(-1)
+        b = params[:self.dim].view(self.dim)
+        w = params[self.dim:].view(self.dim, self.dim)
+
+        out = 0.5*(nn.functional.linear(x, w, b) + nn.functional.linear(x, -w.t(), b))
+        # out = nn.functional.linear(x, w, b)
+
+        return nn.functional.tanh(out)
+
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time,
+                     rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+class BostonHousingTrain:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[:self.n_examples, :]
+        self.y = y[:self.n_examples]
+
+    def __len__(self):
+        return self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+class BostonHousingTest:
+    def __init__(self, n_examples):
+        self.n_examples = n_examples
+
+        X, y = datasets.load_boston(return_X_y=True)
+
+        scaler = preprocessing.StandardScaler().fit(X)
+        self.X = scaler.transform(X)
+
+        self.X = X[self.n_examples:, :]
+        self.y = y[self.n_examples:]
+
+    def __len__(self):
+        return 506 - self.n_examples
+
+    def __getitem__(self, idx):
+        return (self.X[idx], self.y[idx])
+
+
+def get_boston_housing_loaders(batch_size=128, test_train_split=16):
+
+    train_loader = DataLoader(BostonHousingTrain(test_train_split),
+                              batch_size=batch_size, shuffle=True,
+                              num_workers=1, drop_last=False)
+
+    test_loader = DataLoader(BostonHousingTest(test_train_split),
+                             batch_size=batch_size, shuffle=True,
+                             num_workers=1, drop_last=False)
+
+    return train_loader, test_loader
+
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def compute_loss(loss_func, model, dataset_loader):
+	for x, y in dataset_loader:
+		x = x.float().to(device)
+		y = y.float().to(device)
+
+	return loss_func(torch.flatten(model(x)), y)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, 0, 0.01)
+        nn.init.normal_(m.bias, 0, 0.01)
+
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+    logger = get_logger(logpath=os.path.join(
+        args.save, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu)
+                          if torch.cuda.is_available() else 'cpu')
+
+    feature_layers = [ODEBlock(ODEfunc(13, args.hyper_dim, args.hyper_hidden))]
+    fc_layers = [nn.Linear(13, 1)]
+
+    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.MSELoss().to(device)
+
+    train_loader, test_loader = get_boston_housing_loaders(args.batch_size)
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    # lr_fn = learning_rate_with_decay(
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    # )
+
+    # optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        # for param_group in optimizer.param_groups:
+        #     param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+
+        x = x.float().to(device)
+        y = y.float().to(device)
+        loss = criterion(torch.flatten(model(x)), y)
+
+        nfe_forward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        nfe_backward = feature_layers[0].nfe
+        feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+
+        f_nfe_meter.update(nfe_forward)
+        b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_loss = compute_loss(criterion, model, train_loader)
+                # test_loss = compute_loss(criterion, model, test_loader)
+                # logger.info(
+                #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                #     "Train Loss {:.4f} | Test Loss {:.4f}".format(
+                #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                #         b_nfe_meter.avg, train_loss, test_loss
+                #     )
+                # )
+
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Loss {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_loss
+                    )
+                )
+
+Namespace(adjoint=False, batch_size=128, debug=False, gpu=0, hyper_dim=256, hyper_hidden=2, lr=0.01, nepochs=160, save='./experiment1', tol=0.001)
+Sequential(
+  (0): ODEBlock(
+    (odefunc): ODEfunc(
+      (_hypernet): Sequential(
+        (0): Linear(in_features=1, out_features=256, bias=True)
+        (1): Tanh()
+        (2): Linear(in_features=256, out_features=256, bias=True)
+        (3): Tanh()
+        (4): Linear(in_features=256, out_features=182, bias=True)
+      )
+    )
+  )
+  (1): Linear(in_features=13, out_features=1, bias=True)
+)
+Number of parameters: 113092
+Epoch 0000 | Time 0.056 (0.056) | NFE-F 14.0 | NFE-B 0.0 | Train Loss 66.7609
+Epoch 0001 | Time 0.081 (0.056) | NFE-F 14.1 | NFE-B 0.0 | Train Loss 91.0837
+Epoch 0002 | Time 0.080 (0.057) | NFE-F 14.3 | NFE-B 0.0 | Train Loss 79.3701
+Epoch 0003 | Time 0.079 (0.057) | NFE-F 14.4 | NFE-B 0.0 | Train Loss 61.0886
+Epoch 0004 | Time 0.078 (0.057) | NFE-F 14.6 | NFE-B 0.0 | Train Loss 59.0491
+Epoch 0005 | Time 0.080 (0.057) | NFE-F 14.7 | NFE-B 0.0 | Train Loss 67.4426
+Epoch 0006 | Time 0.079 (0.057) | NFE-F 14.8 | NFE-B 0.0 | Train Loss 69.2444
+Epoch 0007 | Time 0.075 (0.058) | NFE-F 15.0 | NFE-B 0.0 | Train Loss 61.6205
+Epoch 0008 | Time 0.077 (0.058) | NFE-F 15.1 | NFE-B 0.0 | Train Loss 53.3317
+Epoch 0009 | Time 0.077 (0.058) | NFE-F 15.2 | NFE-B 0.0 | Train Loss 51.4295
+Epoch 0010 | Time 0.077 (0.058) | NFE-F 15.3 | NFE-B 0.0 | Train Loss 54.6047
+Epoch 0011 | Time 0.077 (0.058) | NFE-F 15.5 | NFE-B 0.0 | Train Loss 56.3178
+Epoch 0012 | Time 0.082 (0.059) | NFE-F 15.6 | NFE-B 0.0 | Train Loss 53.2154
+Epoch 0013 | Time 0.081 (0.059) | NFE-F 15.7 | NFE-B 0.0 | Train Loss 47.8840
+Epoch 0014 | Time 0.077 (0.059) | NFE-F 15.8 | NFE-B 0.0 | Train Loss 44.6766
+Epoch 0015 | Time 0.079 (0.059) | NFE-F 16.0 | NFE-B 0.0 | Train Loss 44.9811
+Epoch 0016 | Time 0.082 (0.059) | NFE-F 16.1 | NFE-B 0.0 | Train Loss 46.2941
+Epoch 0017 | Time 0.082 (0.060) | NFE-F 16.2 | NFE-B 0.0 | Train Loss 45.5470
+Epoch 0018 | Time 0.078 (0.060) | NFE-F 16.3 | NFE-B 0.0 | Train Loss 42.5180
+Epoch 0019 | Time 0.079 (0.060) | NFE-F 16.4 | NFE-B 0.0 | Train Loss 39.4926
+Epoch 0020 | Time 0.078 (0.060) | NFE-F 16.5 | NFE-B 0.0 | Train Loss 38.4018
+Epoch 0021 | Time 0.077 (0.060) | NFE-F 16.7 | NFE-B 0.0 | Train Loss 38.8376
+Epoch 0022 | Time 0.077 (0.060) | NFE-F 16.8 | NFE-B 0.0 | Train Loss 38.8475
+Epoch 0023 | Time 0.078 (0.061) | NFE-F 16.9 | NFE-B 0.0 | Train Loss 37.3366
+Epoch 0024 | Time 0.077 (0.061) | NFE-F 17.0 | NFE-B 0.0 | Train Loss 35.1271
+Epoch 0025 | Time 0.079 (0.061) | NFE-F 17.1 | NFE-B 0.0 | Train Loss 33.7226
+Epoch 0026 | Time 0.078 (0.061) | NFE-F 17.2 | NFE-B 0.0 | Train Loss 33.5351
+Epoch 0027 | Time 0.078 (0.061) | NFE-F 17.3 | NFE-B 0.0 | Train Loss 33.5820
+Epoch 0028 | Time 0.079 (0.062) | NFE-F 17.4 | NFE-B 0.0 | Train Loss 32.8215
+Epoch 0029 | Time 0.078 (0.062) | NFE-F 17.5 | NFE-B 0.0 | Train Loss 31.3671
+Epoch 0030 | Time 0.077 (0.062) | NFE-F 17.6 | NFE-B 0.0 | Train Loss 30.1667
+Epoch 0031 | Time 0.078 (0.062) | NFE-F 17.7 | NFE-B 0.0 | Train Loss 29.7627
+Epoch 0032 | Time 0.078 (0.062) | NFE-F 17.9 | NFE-B 0.0 | Train Loss 29.7093
+Epoch 0033 | Time 0.078 (0.062) | NFE-F 18.0 | NFE-B 0.0 | Train Loss 29.2541
+Epoch 0034 | Time 0.077 (0.062) | NFE-F 18.1 | NFE-B 0.0 | Train Loss 28.2963
+Epoch 0035 | Time 0.075 (0.063) | NFE-F 18.2 | NFE-B 0.0 | Train Loss 27.4052
+Epoch 0036 | Time 0.078 (0.063) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 27.0130
+Epoch 0037 | Time 0.077 (0.063) | NFE-F 18.3 | NFE-B 0.0 | Train Loss 26.8969
+Epoch 0038 | Time 0.077 (0.063) | NFE-F 18.4 | NFE-B 0.0 | Train Loss 26.5566
+Epoch 0039 | Time 0.075 (0.063) | NFE-F 18.5 | NFE-B 0.0 | Train Loss 25.8920
+Epoch 0040 | Time 0.076 (0.063) | NFE-F 18.6 | NFE-B 0.0 | Train Loss 25.2663
+Epoch 0041 | Time 0.076 (0.063) | NFE-F 18.7 | NFE-B 0.0 | Train Loss 24.9626
+Epoch 0042 | Time 0.079 (0.064) | NFE-F 18.8 | NFE-B 0.0 | Train Loss 24.8245
+Epoch 0043 | Time 0.078 (0.064) | NFE-F 18.9 | NFE-B 0.0 | Train Loss 24.5285
+Epoch 0044 | Time 0.078 (0.064) | NFE-F 19.0 | NFE-B 0.0 | Train Loss 24.0390
+Epoch 0045 | Time 0.068 (0.064) | NFE-F 19.1 | NFE-B 0.0 | Train Loss 23.6084
+Epoch 0046 | Time 0.080 (0.064) | NFE-F 19.2 | NFE-B 0.0 | Train Loss 23.3888
+Epoch 0047 | Time 0.074 (0.064) | NFE-F 19.3 | NFE-B 0.0 | Train Loss 23.2385
+Epoch 0048 | Time 0.080 (0.064) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 22.9617
+Epoch 0049 | Time 0.078 (0.064) | NFE-F 19.4 | NFE-B 0.0 | Train Loss 22.5878
+Epoch 0050 | Time 0.081 (0.065) | NFE-F 19.5 | NFE-B 0.0 | Train Loss 22.2928
+Epoch 0051 | Time 0.080 (0.065) | NFE-F 19.6 | NFE-B 0.0 | Train Loss 22.1261
+Epoch 0052 | Time 0.076 (0.065) | NFE-F 19.7 | NFE-B 0.0 | Train Loss 21.9594
+Epoch 0053 | Time 0.080 (0.065) | NFE-F 19.8 | NFE-B 0.0 | Train Loss 21.6977
+Epoch 0054 | Time 0.078 (0.065) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 21.4107
+Epoch 0055 | Time 0.078 (0.065) | NFE-F 19.9 | NFE-B 0.0 | Train Loss 21.2034
+Epoch 0056 | Time 0.076 (0.065) | NFE-F 20.0 | NFE-B 0.0 | Train Loss 21.0555
+Epoch 0057 | Time 0.079 (0.066) | NFE-F 20.1 | NFE-B 0.0 | Train Loss 20.8708
+Epoch 0058 | Time 0.080 (0.066) | NFE-F 20.2 | NFE-B 0.0 | Train Loss 20.6324
+Epoch 0059 | Time 0.077 (0.066) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 20.4142
+Epoch 0060 | Time 0.076 (0.066) | NFE-F 20.3 | NFE-B 0.0 | Train Loss 20.2540
+Epoch 0061 | Time 0.073 (0.066) | NFE-F 20.4 | NFE-B 0.0 | Train Loss 20.1014
+Epoch 0062 | Time 0.075 (0.066) | NFE-F 20.5 | NFE-B 0.0 | Train Loss 19.9089
+Epoch 0063 | Time 0.075 (0.066) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 19.7046
+Epoch 0064 | Time 0.079 (0.066) | NFE-F 20.6 | NFE-B 0.0 | Train Loss 19.5356
+Epoch 0065 | Time 0.079 (0.066) | NFE-F 20.7 | NFE-B 0.0 | Train Loss 19.3909
+Epoch 0066 | Time 0.079 (0.067) | NFE-F 20.8 | NFE-B 0.0 | Train Loss 19.2282
+Epoch 0067 | Time 0.081 (0.067) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 19.0458
+Epoch 0068 | Time 0.081 (0.067) | NFE-F 20.9 | NFE-B 0.0 | Train Loss 18.8785
+Epoch 0069 | Time 0.082 (0.067) | NFE-F 21.0 | NFE-B 0.0 | Train Loss 18.7354
+Epoch 0070 | Time 0.082 (0.067) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 18.5896
+Epoch 0071 | Time 0.078 (0.067) | NFE-F 21.1 | NFE-B 0.0 | Train Loss 18.4277
+Epoch 0072 | Time 0.079 (0.067) | NFE-F 21.2 | NFE-B 0.0 | Train Loss 18.2694
+Epoch 0073 | Time 0.077 (0.067) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 18.1296
+Epoch 0074 | Time 0.078 (0.068) | NFE-F 21.3 | NFE-B 0.0 | Train Loss 17.9943
+Epoch 0075 | Time 0.079 (0.068) | NFE-F 21.4 | NFE-B 0.0 | Train Loss 17.8489
+Epoch 0076 | Time 0.080 (0.068) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 17.7026
+Epoch 0077 | Time 0.081 (0.068) | NFE-F 21.5 | NFE-B 0.0 | Train Loss 17.5689
+Epoch 0078 | Time 0.075 (0.068) | NFE-F 21.6 | NFE-B 0.0 | Train Loss 17.4420
+Epoch 0079 | Time 0.076 (0.068) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 17.3100
+Epoch 0080 | Time 0.082 (0.068) | NFE-F 21.7 | NFE-B 0.0 | Train Loss 17.1762
+Epoch 0081 | Time 0.080 (0.068) | NFE-F 21.8 | NFE-B 0.0 | Train Loss 17.0508
+Epoch 0082 | Time 0.079 (0.068) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 16.9321
+Epoch 0083 | Time 0.084 (0.069) | NFE-F 21.9 | NFE-B 0.0 | Train Loss 16.8114
+Epoch 0084 | Time 0.076 (0.069) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 16.6894
+Epoch 0085 | Time 0.080 (0.069) | NFE-F 22.0 | NFE-B 0.0 | Train Loss 16.5733
+Epoch 0086 | Time 0.079 (0.069) | NFE-F 22.1 | NFE-B 0.0 | Train Loss 16.4630
+Epoch 0087 | Time 0.081 (0.069) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 16.3524
+Epoch 0088 | Time 0.080 (0.069) | NFE-F 22.2 | NFE-B 0.0 | Train Loss 16.2413
+Epoch 0089 | Time 0.080 (0.069) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 16.1346
+Epoch 0090 | Time 0.078 (0.069) | NFE-F 22.3 | NFE-B 0.0 | Train Loss 16.0327
+Epoch 0091 | Time 0.080 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 15.9313
+Epoch 0092 | Time 0.076 (0.069) | NFE-F 22.4 | NFE-B 0.0 | Train Loss 15.8302
+Epoch 0093 | Time 0.076 (0.070) | NFE-F 22.5 | NFE-B 0.0 | Train Loss 15.7326
+Epoch 0094 | Time 0.076 (0.070) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 15.6389
+Epoch 0095 | Time 0.079 (0.070) | NFE-F 22.6 | NFE-B 0.0 | Train Loss 15.5460
+Epoch 0096 | Time 0.078 (0.070) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 15.4539
+Epoch 0097 | Time 0.080 (0.070) | NFE-F 22.7 | NFE-B 0.0 | Train Loss 15.3648
+Epoch 0098 | Time 0.075 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 15.2788
+Epoch 0099 | Time 0.074 (0.070) | NFE-F 22.8 | NFE-B 0.0 | Train Loss 15.1937
+Epoch 0100 | Time 0.081 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 15.1098
+Epoch 0101 | Time 0.082 (0.070) | NFE-F 22.9 | NFE-B 0.0 | Train Loss 15.0285
+Epoch 0102 | Time 0.083 (0.070) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 14.9496
+Epoch 0103 | Time 0.077 (0.070) | NFE-F 23.0 | NFE-B 0.0 | Train Loss 14.8718
+Epoch 0104 | Time 0.078 (0.070) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 14.7953
+Epoch 0105 | Time 0.081 (0.071) | NFE-F 23.1 | NFE-B 0.0 | Train Loss 14.7211
+Epoch 0106 | Time 0.085 (0.071) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 14.6488
+Epoch 0107 | Time 0.079 (0.071) | NFE-F 23.2 | NFE-B 0.0 | Train Loss 14.5776
+Epoch 0108 | Time 0.076 (0.071) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 14.5078
+Epoch 0109 | Time 0.077 (0.071) | NFE-F 23.3 | NFE-B 0.0 | Train Loss 14.4400
+Epoch 0110 | Time 0.081 (0.071) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 14.3738
+Epoch 0111 | Time 0.078 (0.071) | NFE-F 23.4 | NFE-B 0.0 | Train Loss 14.3087
+Epoch 0112 | Time 0.078 (0.071) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 14.2450
+Epoch 0113 | Time 0.079 (0.071) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 14.1830
+Epoch 0114 | Time 0.079 (0.071) | NFE-F 23.5 | NFE-B 0.0 | Train Loss 14.1223
+Epoch 0115 | Time 0.082 (0.071) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 14.0627
+Epoch 0116 | Time 0.084 (0.072) | NFE-F 23.6 | NFE-B 0.0 | Train Loss 14.0045
+Epoch 0117 | Time 0.083 (0.072) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 13.9477
+Epoch 0118 | Time 0.081 (0.072) | NFE-F 23.7 | NFE-B 0.0 | Train Loss 13.8921
+Epoch 0119 | Time 0.081 (0.072) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 13.8376
+Epoch 0120 | Time 0.079 (0.072) | NFE-F 23.8 | NFE-B 0.0 | Train Loss 13.7844
+Epoch 0121 | Time 0.076 (0.072) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 13.7324
+Epoch 0122 | Time 0.082 (0.072) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 13.6815
+Epoch 0123 | Time 0.079 (0.072) | NFE-F 23.9 | NFE-B 0.0 | Train Loss 13.6316
+Epoch 0124 | Time 0.079 (0.072) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 13.5829
+Epoch 0125 | Time 0.077 (0.072) | NFE-F 24.0 | NFE-B 0.0 | Train Loss 13.5353
+Epoch 0126 | Time 0.080 (0.072) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 13.4886
+Epoch 0127 | Time 0.079 (0.072) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 13.4430
+Epoch 0128 | Time 0.081 (0.072) | NFE-F 24.1 | NFE-B 0.0 | Train Loss 13.3984
+Epoch 0129 | Time 0.082 (0.073) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 13.3547
+Epoch 0130 | Time 0.077 (0.073) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 13.3119
+Epoch 0131 | Time 0.078 (0.073) | NFE-F 24.2 | NFE-B 0.0 | Train Loss 13.2701
+Epoch 0132 | Time 0.080 (0.073) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 13.2292
+Epoch 0133 | Time 0.078 (0.073) | NFE-F 24.3 | NFE-B 0.0 | Train Loss 13.1891
+Epoch 0134 | Time 0.080 (0.073) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 13.1499
+Epoch 0135 | Time 0.078 (0.073) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 13.1116
+Epoch 0136 | Time 0.079 (0.073) | NFE-F 24.4 | NFE-B 0.0 | Train Loss 13.0740
+Epoch 0137 | Time 0.083 (0.073) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 13.0373
+Epoch 0138 | Time 0.080 (0.073) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 13.0013
+Epoch 0139 | Time 0.079 (0.073) | NFE-F 24.5 | NFE-B 0.0 | Train Loss 12.9661
+Epoch 0140 | Time 0.079 (0.073) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 12.9316
+Epoch 0141 | Time 0.077 (0.073) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 12.8979
+Epoch 0142 | Time 0.078 (0.073) | NFE-F 24.6 | NFE-B 0.0 | Train Loss 12.8648
+Epoch 0143 | Time 0.078 (0.073) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 12.8325
+Epoch 0144 | Time 0.078 (0.073) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 12.8008
+Epoch 0145 | Time 0.073 (0.073) | NFE-F 24.7 | NFE-B 0.0 | Train Loss 12.7697
+Epoch 0146 | Time 0.081 (0.074) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 12.7393
+Epoch 0147 | Time 0.076 (0.074) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 12.7095
+Epoch 0148 | Time 0.077 (0.074) | NFE-F 24.8 | NFE-B 0.0 | Train Loss 12.6804
+Epoch 0149 | Time 0.076 (0.074) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 12.6518
+Epoch 0150 | Time 0.077 (0.074) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 12.6238
+Epoch 0151 | Time 0.076 (0.074) | NFE-F 24.9 | NFE-B 0.0 | Train Loss 12.5964
+Epoch 0152 | Time 0.075 (0.074) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 12.5695
+Epoch 0153 | Time 0.078 (0.074) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 12.5432
+Epoch 0154 | Time 0.074 (0.074) | NFE-F 25.0 | NFE-B 0.0 | Train Loss 12.5173
+Epoch 0155 | Time 0.079 (0.074) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 12.4920
+Epoch 0156 | Time 0.076 (0.074) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 12.4672
+Epoch 0157 | Time 0.083 (0.074) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 12.4429
+Epoch 0158 | Time 0.076 (0.074) | NFE-F 25.1 | NFE-B 0.0 | Train Loss 12.4191
+Epoch 0159 | Time 0.078 (0.074) | NFE-F 25.2 | NFE-B 0.0 | Train Loss 12.3957
