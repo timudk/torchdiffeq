@@ -40,10 +40,14 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 2
-N_LIFTING = 0
-HYPERNET_DIM = 16
+N_LIFTING = 2
+HYPERNET_DIM = 64
 HYPERNET_HIDDEN_LAYERS = 8
-data_file = 'peaks_data/classes_2/length_6_points_12.pkl'
+BATCHSIZE = 51
+data_file = 'peaks_data/classes_2/length_6_points_8.pkl'
+
+#python3 odenet_peaks.py --batch_size 51 --lr 0.1 --nepochs 400 --tol 1e-4 --adjoint True N_LIFTING = 2 HYPERNET_DIM = 64 HYPERNET_HIDDEN_LAYERS = 8
+
 
 
 def weights_init(m):
@@ -64,8 +68,8 @@ class PeaksTrainingSet(Dataset):
         for i in range(len(self.data[0])):
             if N_LIFTING % 2 == 0:
                 for j in range(1 + int(N_LIFTING / 2)):
-                    self.x[i, j] = self.data[0][i][0]
-                    self.x[i, j + 1] = self.data[0][i][1]
+                    self.x[i, 2 * j] = self.data[0][i][0]
+                    self.x[i, 2 * j + 1] = self.data[0][i][1]
             self.y[i] = self.data[0][i][2]
 
         plt.scatter(self.x[:, 0], self.x[:, 1], c=self.y[:])
@@ -93,8 +97,8 @@ class PeaksTestSet(Dataset):
         for i in range(len(self.data[1])):
             if N_LIFTING % 2 == 0:
                 for j in range(1 + int(N_LIFTING / 2)):
-                    self.x[i, j] = self.data[1][i][j]
-                    self.x[i, j + 1] = self.data[1][i][j + 1]
+                    self.x[i, 2 * j] = self.data[1][i][0]
+                    self.x[i, 2 * j + 1] = self.data[1][i][1]
             self.y[i] = self.data[1][i][2]
 
     def __len__(self):
@@ -137,10 +141,11 @@ class ODEfunc(nn.Module):
         params = self._hypernet(t.view(1, 1)).view(-1)
         b = params[:self.dim].view(self.dim)
         w = params[self.dim:].view(self.dim, self.dim)
-        # print(w)
 
-        # return 0.5*(F.linear(x, w, b) - F.linear(x, -w, b))
-        return F.linear(x, w, b)
+        out = nn.functional.tanh(0.5 * (F.linear(x, w, b) + F.linear(x, -w.t(), b)))
+        # out = nn.functional.tanh(F.linear(x, w, b))
+
+        return out
 
 
 class ODEBlock(nn.Module):
@@ -186,7 +191,7 @@ class RunningAverageMeter(object):
         self.val = val
 
 
-def get_peaks_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+def get_peaks_loaders(data_aug=False, batch_size=BATCHSIZE, test_batch_size=1000, perc=1.0):
     if data_aug:
         transform_train = transforms.Compose([
             transforms.RandomCrop(28, padding=4),
@@ -306,7 +311,7 @@ if __name__ == '__main__':
 
     feature_layers = [
         ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
-    fc_layers = [nn.Tanh(), nn.Linear(2 + N_LIFTING, N_CLASSES)]
+    fc_layers = [nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
     # model = nn.Sequential(*feature_layers, *fc_layers).to(device)
     model = nn.Sequential(*feature_layers, *fc_layers).to(device)
@@ -324,12 +329,12 @@ if __name__ == '__main__':
     batches_per_epoch = len(train_loader)
 
     # lr_fn = learning_rate_with_decay(
-    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[10, 30, 50],
-    #     decay_rates=[1, 0.1, 0.01, 0.001]
+    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[500],
+    #     decay_rates=[1, 0.1]
     # )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    # optimizer = torch.optim.Adam(model.parameters())
+    # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
@@ -378,8 +383,8 @@ if __name__ == '__main__':
 
         if itr % (10 * batches_per_epoch) == 0:
             with torch.no_grad():
-                plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
-                plt.show()
+                # plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
+                # plt.show()
                 train_acc = accuracy(model, train_loader)
                 print('Training accuracy:', train_acc)
                 # val_acc = accuracy(model, test_loader)
@@ -401,3 +406,15 @@ if __name__ == '__main__':
                           itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
                           b_nfe_meter.avg, val_acc
                       ))
+
+    with torch.no_grad():
+        x, y = data_gen.__next__()
+
+        x = x.to(device)
+        y = y.to(device)
+
+        x = x.float()
+        y = y.long()
+
+        plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
+        plt.show()
