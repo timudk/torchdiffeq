@@ -40,11 +40,11 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 2
-N_LIFTING = 0
+N_LIFTING = 2
 HYPERNET_DIM = 32
 HYPERNET_HIDDEN_LAYERS = 8
 BATCHSIZE = 128
-data_file = 'peaks_data/classes_2/length_6_points_80.pkl'
+data_file = 'peaks_data/classes_2/length_6_points_160.pkl'
 
 #python3 odenet_peaks.py --batch_size 51 --lr 0.1 --nepochs 400 --tol 1e-4 --adjoint True N_LIFTING = 2 HYPERNET_DIM = 64 HYPERNET_HIDDEN_LAYERS = 8
 
@@ -110,12 +110,49 @@ class PeaksTestSet(Dataset):
         return sample
 
 
+# class ODEfunc(nn.Module):
+
+#     def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
+#         super(ODEfunc, self).__init__()
+#         self.dim = dim
+#         self.params_dim = self.dim**2 + self.dim
+
+#         print('Number of parameters in output net:', self.params_dim)
+
+#         layers = []
+#         dims = [1] + [hypernet_dim] * \
+#             hypernet_hidden_layers + [self.params_dim]
+
+#         for i in range(1, len(dims)):
+#             layers.append(nn.Linear(dims[i - 1], dims[i]))
+#             if i < len(dims) - 1:
+#                 layers.append(activation())
+#         self._hypernet = nn.Sequential(*layers)
+#         self._hypernet.apply(weights_init)
+
+#         print('Number of parameters in hypernet:', sum(p.numel()
+#                                                        for p in self._hypernet.parameters() if p.requires_grad))
+
+#         self.nfe = 0
+
+#     def forward(self, t, x):
+#         self.nfe += 1
+
+#         params = self._hypernet(t.view(1, 1)).view(-1)
+#         b = params[:self.dim].view(self.dim)
+#         w = params[self.dim:].view(self.dim, self.dim)
+
+#         out = nn.functional.tanh(0.5 * (F.linear(x, w, b) + F.linear(x, -w.t(), b)))
+#         # out = nn.functional.tanh(F.linear(x, w, b))
+
+#         return out
+
 class ODEfunc(nn.Module):
 
     def __init__(self, dim, hypernet_dim, hypernet_hidden_layers, activation=nn.Tanh):
         super(ODEfunc, self).__init__()
         self.dim = dim
-        self.params_dim = self.dim**2 + self.dim
+        self.params_dim = self.dim**2 + 2*self.dim
 
         print('Number of parameters in output net:', self.params_dim)
 
@@ -138,14 +175,21 @@ class ODEfunc(nn.Module):
     def forward(self, t, x):
         self.nfe += 1
 
+        # print(x)
+        # print(x.narrow(1, 0, self.dim))
+
         params = self._hypernet(t.view(1, 1)).view(-1)
-        b = params[:self.dim].view(self.dim)
-        w = params[self.dim:].view(self.dim, self.dim)
+        b = params[:(2*self.dim)].view(2*self.dim)
+        w = params[(2*self.dim):].view(self.dim, self.dim)
 
-        out = nn.functional.tanh(0.5 * (F.linear(x, w, b) + F.linear(x, -w.t(), b)))
-        # out = nn.functional.tanh(F.linear(x, w, b))
+        out_1 = F.linear(x.narrow(1, 0, self.dim), w)
+        out_2 = F.linear(x.narrow(1, self.dim, self.dim), -w.t())
+        # print(out_1)
+        # print(out_2)
 
-        return out
+        out = torch.cat((out_1, out_2), 1) + b
+
+        return nn.functional.tanh(out)
 
 
 class ODEBlock(nn.Module):
@@ -309,8 +353,8 @@ if __name__ == '__main__':
 
     is_odenet = args.network == 'odenet'
 
-    feature_layers = [
-        ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
+    # feature_layers = [ODEBlock(ODEfunc(2 + N_LIFTING, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))]
+    feature_layers = [ODEBlock(ODEfunc(2, HYPERNET_DIM, HYPERNET_HIDDEN_LAYERS))] 
     fc_layers = [nn.Linear(2 + N_LIFTING, N_CLASSES)]
 
     # model = nn.Sequential(*feature_layers, *fc_layers).to(device)
