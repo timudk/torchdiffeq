@@ -40,11 +40,11 @@ else:
     from torchdiffeq import odeint
 
 N_CLASSES = 2
-N_LIFTING = 2
-HYPERNET_DIM = 64
+N_LIFTING = 0
+HYPERNET_DIM = 32
 HYPERNET_HIDDEN_LAYERS = 8
-BATCHSIZE = 51
-data_file = 'peaks_data/classes_2/length_6_points_8.pkl'
+BATCHSIZE = 128
+data_file = 'peaks_data/classes_2/length_6_points_80.pkl'
 
 #python3 odenet_peaks.py --batch_size 51 --lr 0.1 --nepochs 400 --tol 1e-4 --adjoint True N_LIFTING = 2 HYPERNET_DIM = 64 HYPERNET_HIDDEN_LAYERS = 8
 
@@ -53,7 +53,7 @@ data_file = 'peaks_data/classes_2/length_6_points_8.pkl'
 def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1 or classname.find('Conv') != -1:
-        nn.init.normal_(m.weight, 0, 0.1)
+        nn.init.constant_(m.weight, 0)
         nn.init.normal_(m.bias, 0, 0.1)
 
 
@@ -72,8 +72,8 @@ class PeaksTrainingSet(Dataset):
                     self.x[i, 2 * j + 1] = self.data[0][i][1]
             self.y[i] = self.data[0][i][2]
 
-        plt.scatter(self.x[:, 0], self.x[:, 1], c=self.y[:])
-        plt.show()
+        # plt.scatter(self.x[:, 0], self.x[:, 1], c=self.y[:])
+        # plt.show()
 
         print('Number of training points:', self.__len__())
 
@@ -328,10 +328,10 @@ if __name__ == '__main__':
     data_gen = inf_generator(train_loader)
     batches_per_epoch = len(train_loader)
 
-    # lr_fn = learning_rate_with_decay(
-    #     args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[500],
-    #     decay_rates=[1, 0.1]
-    # )
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
     # optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -344,8 +344,8 @@ if __name__ == '__main__':
 
     for itr in range(args.nepochs * batches_per_epoch):
 
-        # for param_group in optimizer.param_groups:
-        #     param_group['lr'] = lr_fn(itr)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
@@ -359,7 +359,7 @@ if __name__ == '__main__':
         logits = model(x)
         # print(logits.shape)
         loss = criterion(logits, y)
-        print('Loss:', loss)
+        # print('Loss:', loss)
 
         if is_odenet:
             nfe_forward = feature_layers[0].nfe
@@ -385,10 +385,12 @@ if __name__ == '__main__':
             with torch.no_grad():
                 # plt.scatter(model[0](x)[:, 0], model[0](x)[:, 1], c=y[:])
                 # plt.show()
+                # print('Epoch:', itr // batches_per_epoch)
                 train_acc = accuracy(model, train_loader)
-                print('Training accuracy:', train_acc)
+                # print('Training accuracy:', train_acc)
                 # val_acc = accuracy(model, test_loader)
                 val_acc = accuracy(model, test_loader)
+                # print('Test accuracy:', val_acc)
                 if val_acc > best_acc:
                     if args.save != 'NONE':
                         torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(
@@ -396,15 +398,15 @@ if __name__ == '__main__':
                     best_acc = val_acc
                 # logger.info(
                 #     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                #     "Test Acc {:.4f}".format(
+                #     "Test Acc {:.4f} | Train Acc {:.4f}".format(
                 #         itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                #         b_nfe_meter.avg, val_acc
+                #         b_nfe_meter.avg, val_acc, train_acc
                 #     )
                 # )
                 print("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                      "Test Acc {:.4f}".format(
-                          itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                          b_nfe_meter.avg, val_acc
+                    "Test Acc {:.4f} | Train Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, val_acc, train_acc
                       ))
 
     with torch.no_grad():
