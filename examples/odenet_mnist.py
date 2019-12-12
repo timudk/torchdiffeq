@@ -126,7 +126,7 @@ class ODEBlock(nn.Module):
         print('ODEBlock forward pass.')
 
         self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol, method='euler', options={'step_size':0.01})
         return out[1]
 
     @property
